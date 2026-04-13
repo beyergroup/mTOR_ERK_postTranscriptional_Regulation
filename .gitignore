@@ -1,0 +1,9 @@
+*.RData
+*.rds
+*.h5
+*.bam
+*.fastq
+*.csv
+*.tsv
+__pycache__/
+.DS_Store

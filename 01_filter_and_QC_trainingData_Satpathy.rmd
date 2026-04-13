@@ -1,0 +1,750 @@
+---
+title: "Proteomics Filtering Pipeline"
+subtitle: "Lung Tumour — Satpathy 2021"
+author: "Yashna Paul"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    code_folding: hide
+    theme: flatly
+    number_sections: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  warning    = FALSE,
+  message    = FALSE,
+  fig.width  = 8,
+  fig.height = 6,
+  fig.align  = "center",
+  cache      = FALSE
+)
+```
+
+# Setup
+
+> **Aim:** Load required packages and set seed for reproducibility.
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(matrixStats)
+  library(knitr)
+  library(kableExtra)
+})
+
+set.seed(123)
+```
+
+# Load Data
+
+> **Aim:** Read the raw protein and mRNA expression matrices for the Gilette
+> 2020 lung tumour cohort. Rows are genes (identified by gene symbol), columns
+> are samples. These are log-ratio TMT values that have already been
+> centred/normalised upstream. We record the initial dimensions before any
+> filtering.
+
+```{r load-data}
+data_dir <- "/cellfile/DATASETS/Human/Multi-tissue/Multi_omics/Public/LamanTripEtAl2025_processedMatrices/"
+
+prot_data <- read_csv(paste0(data_dir, "Data/lung_satpathy2021_prot_tumor.csv"), show_col_types = FALSE)
+mrna_data <- read_csv(paste0(data_dir,"Data/lung_satpathy2021_rna_tumor_idfix_subsetted.csv"), show_col_types = FALSE)
+
+expr <- prot_data %>%
+  dplyr::select(where(is.numeric)) %>%
+  as.matrix()
+rownames(expr) <- prot_data$symbol
+
+mrna <- mrna_data %>%
+  dplyr::select(where(is.numeric)) %>%
+  as.matrix()
+rownames(mrna) <- mrna_data$symbol
+
+cat("Initial proteins:", nrow(expr), "\n")
+cat("Initial mRNA genes:", nrow(mrna), "\n")
+cat("Protein samples:", ncol(expr), "\n")
+cat("mRNA samples:", ncol(mrna), "\n")
+```
+
+# mRNA–Protein Correlation (Before Filtering)
+
+> **Aim:** Before applying any filters, visualise the global relationship
+> between mean mRNA and mean protein expression across genes. Each dot is one
+> gene, plotted at its mean expression across all samples. This serves as a
+> baseline — the correlation should improve after filtering removes noisy,
+> low-abundance proteins near the detection limit.
+
+```{r cor-before-filter, fig.height=6, fig.width=12}
+common_genes_raw   <- intersect(rownames(expr), rownames(mrna))
+common_samples_raw <- intersect(colnames(expr), colnames(mrna))
+
+prot_common_raw <- expr[common_genes_raw, common_samples_raw, drop = FALSE]
+mrna_common_raw <- mrna[common_genes_raw, common_samples_raw, drop = FALSE]
+
+gene_means_before <- tibble(
+  gene         = common_genes_raw,
+  protein_mean = rowMeans(prot_common_raw, na.rm = TRUE),
+  mrna_mean    = rowMeans(mrna_common_raw, na.rm = TRUE)
+) %>%
+  filter(is.finite(protein_mean) & is.finite(mrna_mean))
+
+cor_pearson_before  <- cor.test(gene_means_before$mrna_mean,
+                                gene_means_before$protein_mean,
+                                method = "pearson")
+cor_spearman_before <- cor.test(gene_means_before$mrna_mean,
+                                gene_means_before$protein_mean,
+                                method = "spearman")
+
+p_bef_pear <- ggplot(gene_means_before, aes(x = mrna_mean, y = protein_mean)) +
+  geom_point(alpha = 0.3, size = 0.8, colour = "grey40") +
+  geom_smooth(method = "lm", se = FALSE, colour = "red3", linewidth = 0.8) +
+  labs(x = "Mean mRNA expression", y = "Mean protein expression",
+       title = "Before Filtering — Pearson",
+       subtitle = sprintf("r = %.3f (p = %.2e), n = %d genes",
+                          cor_pearson_before$estimate,
+                          cor_pearson_before$p.value,
+                          nrow(gene_means_before))) +
+  theme_minimal(base_size = 13)
+
+p_bef_spear <- ggplot(gene_means_before, aes(x = mrna_mean, y = protein_mean)) +
+  geom_point(alpha = 0.3, size = 0.8, colour = "grey40") +
+  geom_smooth(method = "lm", se = FALSE, colour = "steelblue", linewidth = 0.8) +
+  labs(x = "Mean mRNA expression", y = "Mean protein expression",
+       title = "Before Filtering — Spearman",
+       subtitle = sprintf("rho = %.3f (p = %.2e), n = %d genes",
+                          cor_spearman_before$estimate,
+                          cor_spearman_before$p.value,
+                          nrow(gene_means_before))) +
+  theme_minimal(base_size = 13)
+
+library(patchwork)
+p_bef_pear + p_bef_spear +
+  plot_annotation(title = "Per-Gene mRNA vs Protein (Before Filtering)",
+                  subtitle = "Each dot = one gene at its mean expression across all samples")
+```
+
+## Per-Gene Correlation Across Samples (Before Filtering)
+
+> **Aim:** For each gene, compute the Spearman correlation between its protein
+> and mRNA values across all samples. This gives one ρ per gene and answers:
+> "For this specific gene, do samples with higher mRNA also have higher
+> protein?" This is complementary to the mean-expression plot above — that
+> one asks whether highly-transcribed genes tend to have high protein (across
+> genes), while this one asks whether within-gene variation tracks between
+> mRNA and protein (across samples). Computing this before filtering provides
+> a baseline to compare against the post-filtering histogram.
+
+```{r per-gene-cor-before, fig.height=6}
+gene_cor_before <- vapply(seq_len(nrow(prot_common_raw)), function(i) {
+  cor(prot_common_raw[i, ], mrna_common_raw[i, ],
+      method = "spearman", use = "pairwise.complete.obs")
+}, numeric(1))
+names(gene_cor_before) <- rownames(prot_common_raw)
+gene_cor_before <- gene_cor_before[is.finite(gene_cor_before)]
+med_cor_before  <- median(gene_cor_before, na.rm = TRUE)
+
+par(mar = c(4.2, 4.2, 1.5, 1.0), mgp = c(2.4, 0.8, 0), tcl = -0.25,
+    cex.lab = 1.4, cex.axis = 1.0, bty = "l")
+hist(gene_cor_before, breaks = 50, col = "grey85", border = "grey70",
+     main = "", xlab = "Per-gene Spearman rho (across samples)",
+     ylab = "Number of genes")
+abline(v = 0, col = "black", lwd = 2, lty = 3)
+abline(v = med_cor_before, col = "red3", lwd = 2.5, lty = 2)
+legend("topright",
+       legend = c("No correlation", sprintf("Median = %.2f", med_cor_before)),
+       col = c("black", "red3"), lwd = c(2, 2.5), lty = c(3, 2),
+       bty = "n", cex = 1.2, inset = 0.02)
+
+cat(sprintf("Before filtering: %d genes, median Spearman rho = %.3f\n",
+            length(gene_cor_before), med_cor_before))
+```
+
+
+# Filtering Pipeline
+
+> **Aim:** Sequentially apply four filters to reduce technical noise and
+> retain only features with reliable, variable measurements. The pipeline
+> reduces ~11,000 proteins to ~5,000 informative features.
+
+## Step 1: Presence Filter
+
+> **What it does:** Computes a global expression threshold (5th percentile of
+> all protein values). For each protein, calculates the fraction of samples
+> where expression exceeds this threshold. Proteins detected in fewer than 95%
+> of samples are removed.
+>
+> **Why:** Proteins near the detection limit have unreliable measurements.
+> Their apparent variability may reflect missingness patterns rather than
+> genuine biology. This is the most aggressive filter and typically removes
+> ~40–50% of proteins.
+
+```{r step1-presence, fig.height=10}
+expr_q05 <- quantile(expr, 0.05, na.rm = TRUE)
+presence <- rowMeans(expr > expr_q05, na.rm = TRUE)
+
+par(mfrow = c(2, 1), mar = c(4.2, 4.2, 1.5, 1.0), mgp = c(2.4, 0.8, 0),
+    cex.lab = 1.2, cex.axis = 1.0, bty = "l")
+
+hist(as.vector(expr), breaks = 500, xlim = c(-10, 10),
+     col = "grey85", border = "grey70",
+     main = "", xlab = "Expression value", ylab = "Frequency")
+abline(v = expr_q05, col = "red3", lwd = 2.5, lty = 2)
+legend("topright", legend = sprintf("5%% threshold = %.2f", expr_q05),
+       col = "red3", lwd = 2.5, lty = 2, bty = "n", cex = 1.1)
+
+hist(presence, breaks = 100, xlim = c(0, 1),
+     col = "grey85", border = "grey70",
+     main = "", xlab = "Fraction of samples above threshold",
+     ylab = "Number of proteins")
+abline(v = 0.95, col = "red3", lwd = 2.5, lty = 2)
+legend("topright", legend = "Presence cutoff = 0.95",
+       col = "red3", lwd = 2.5, lty = 2, bty = "n", cex = 1.1)
+
+par(mfrow = c(1, 1))
+
+expr_filt <- expr[presence >= 0.95, , drop = FALSE]
+n_after_presence <- nrow(expr_filt)
+cat(sprintf("After presence filter: %d → %d proteins\n", nrow(expr), n_after_presence))
+```
+
+## Step 2: IQR Filter (Protein)
+
+> **What it does:** Computes the interquartile range (IQR) of each protein
+> across samples and removes the bottom 10%.
+>
+> **Why:** Proteins with near-zero IQR have essentially constant expression
+> and carry no discriminative signal for downstream modelling. IQR is preferred
+> over standard deviation because it is robust to outliers — a single extreme
+> sample will not inflate the spread estimate and rescue a genuinely flat
+> protein.
+
+```{r step2-iqr-prot, fig.height=5}
+iqr_vals <- apply(expr_filt, 1, IQR, na.rm = TRUE)
+iqr_cut  <- quantile(iqr_vals, 0.10, na.rm = TRUE)
+
+par(mar = c(4.2, 4.2, 1.5, 1.0), mgp = c(2.4, 0.8, 0),
+    cex.lab = 1.2, cex.axis = 1.0, bty = "l")
+hist(iqr_vals, breaks = 100,
+     col = "grey85", border = "grey70",
+     main = "", xlab = "IQR across samples", ylab = "Number of proteins")
+abline(v = iqr_cut, col = "red3", lwd = 2.5, lty = 2)
+legend("topright", legend = sprintf("IQR cutoff (10%%) = %.2f", iqr_cut),
+       col = "red3", lwd = 2.5, lty = 2, bty = "n", cex = 1.1)
+
+n_before <- nrow(expr_filt)
+expr_filt <- expr_filt[iqr_vals > iqr_cut, , drop = FALSE]
+n_after_iqr <- nrow(expr_filt)
+cat(sprintf("After IQR filter: %d → %d proteins\n", n_before, n_after_iqr))
+```
+
+## Step 3: MAD Filter (Protein)
+
+> **What it does:** Computes the median absolute deviation (MAD) of each
+> protein across samples and removes the bottom 5%.
+>
+> **Why:** This is a second robustness layer. It catches proteins that passed
+> the IQR filter but still have very low dispersion around the median — for
+> instance, proteins with a tight IQR but a single extreme outlier inflating
+> the range. This conservative cleanup removes very few additional proteins.
+
+```{r step3-mad, fig.height=5}
+mad_vals <- rowMads(expr_filt, na.rm = TRUE)
+mad_cut  <- quantile(mad_vals, 0.05, na.rm = TRUE)
+
+par(mar = c(4.2, 4.2, 1.5, 1.0), mgp = c(2.4, 0.8, 0),
+    cex.lab = 1.2, cex.axis = 1.0, bty = "l")
+hist(mad_vals, breaks = 100,
+     col = "grey85", border = "grey70",
+     main = "", xlab = "MAD across samples", ylab = "Number of proteins")
+abline(v = mad_cut, col = "red3", lwd = 2.5, lty = 2)
+legend("topright", legend = sprintf("MAD cutoff (5%%) = %.2f", mad_cut),
+       col = "red3", lwd = 2.5, lty = 2, bty = "n", cex = 1.1)
+
+n_before <- nrow(expr_filt)
+expr_filt <- expr_filt[mad_vals > mad_cut, , drop = FALSE]
+n_after_mad <- nrow(expr_filt)
+cat(sprintf("After MAD filter: %d → %d proteins\n", n_before, n_after_mad))
+```
+
+## Step 4: IQR Filter (mRNA)
+
+> **What it does:** Computes the IQR of each mRNA feature across samples and
+> removes the bottom 5%.
+>
+> **Why:** Ensures that mRNA features used in downstream modelling (both for
+> OLS residualisation and as LASSO predictors in Model B) have sufficient
+> cross-sample variability. A more lenient cutoff (5% vs 10% for proteins)
+> is used because mRNA data typically has fewer near-zero-variance features.
+
+```{r step4-iqr-mrna, fig.height=5}
+mrna_iqr     <- apply(mrna, 1, IQR, na.rm = TRUE)
+iqr_cut_mrna <- quantile(mrna_iqr, 0.05, na.rm = TRUE)
+
+par(mar = c(4.2, 4.2, 1.5, 1.0), mgp = c(2.4, 0.8, 0),
+    cex.lab = 1.2, cex.axis = 1.0, bty = "l")
+hist(mrna_iqr, breaks = 100,
+     col = "grey85", border = "grey70",
+     main = "", xlab = "IQR across samples", ylab = "Number of genes")
+abline(v = iqr_cut_mrna, col = "red3", lwd = 2.5, lty = 2)
+legend("topright", legend = sprintf("IQR cutoff (5%%) = %.2f", iqr_cut_mrna),
+       col = "red3", lwd = 2.5, lty = 2, bty = "n", cex = 1.1)
+
+mrna_filt <- mrna[mrna_iqr > iqr_cut_mrna, , drop = FALSE]
+n_after_mrna_iqr <- nrow(mrna_filt)
+cat(sprintf("After mRNA IQR filter: %d → %d genes\n", nrow(mrna), n_after_mrna_iqr))
+```
+
+## Step 5: Match Proteins with mRNA
+
+> **What it does:** Intersects the gene symbols and sample IDs between the
+> filtered protein and mRNA matrices so that both matrices have identical
+> rows (genes) and columns (samples).
+>
+> **Why:** Downstream analyses (OLS residualisation, LASSO modelling) require
+> paired protein–mRNA measurements for each gene in each sample. Any gene
+> or sample present in only one matrix must be dropped.
+
+```{r step5-match}
+common_genes   <- intersect(rownames(expr_filt), rownames(mrna_filt))
+expr_filt      <- expr_filt[common_genes, , drop = FALSE]
+mrna_filt      <- mrna_filt[common_genes, , drop = FALSE]
+
+common_samples <- intersect(colnames(expr_filt), colnames(mrna_filt))
+expr_filt      <- expr_filt[, common_samples, drop = FALSE]
+mrna_filt      <- mrna_filt[, common_samples, drop = FALSE]
+
+cat(sprintf("After matching: %d genes × %d samples\n",
+            nrow(expr_filt), ncol(expr_filt)))
+```
+
+
+# mRNA–Protein Correlation (After Filtering)
+
+> **Aim:** Repeat the global mean-expression correlation plot from Section 3,
+> now using the filtered matrices. Each dot is one gene at its mean mRNA (x)
+> vs mean protein (y) across samples. Comparing with the pre-filtering plot
+> shows whether the filters removed noisy genes that were distorting the
+> global relationship. The correlation should increase after filtering.
+
+```{r cor-after-filter, fig.height=6, fig.width=12}
+gene_means_after <- tibble(
+  gene         = rownames(expr_filt),
+  protein_mean = rowMeans(expr_filt, na.rm = TRUE),
+  mrna_mean    = rowMeans(mrna_filt, na.rm = TRUE)
+) %>%
+  filter(is.finite(protein_mean) & is.finite(mrna_mean))
+
+cor_pearson_after  <- cor.test(gene_means_after$mrna_mean,
+                               gene_means_after$protein_mean,
+                               method = "pearson")
+cor_spearman_after <- cor.test(gene_means_after$mrna_mean,
+                               gene_means_after$protein_mean,
+                               method = "spearman")
+
+p_aft_pear <- ggplot(gene_means_after, aes(x = mrna_mean, y = protein_mean)) +
+  geom_point(alpha = 0.3, size = 0.8, colour = "grey40") +
+  geom_smooth(method = "lm", se = FALSE, colour = "red3", linewidth = 0.8) +
+  labs(x = "Mean mRNA expression", y = "Mean protein expression",
+       title = "After Filtering — Pearson",
+       subtitle = sprintf("r = %.3f (p = %.2e), n = %d genes",
+                          cor_pearson_after$estimate,
+                          cor_pearson_after$p.value,
+                          nrow(gene_means_after))) +
+  theme_minimal(base_size = 13)
+
+p_aft_spear <- ggplot(gene_means_after, aes(x = mrna_mean, y = protein_mean)) +
+  geom_point(alpha = 0.3, size = 0.8, colour = "grey40") +
+  geom_smooth(method = "lm", se = FALSE, colour = "steelblue", linewidth = 0.8) +
+  labs(x = "Mean mRNA expression", y = "Mean protein expression",
+       title = "After Filtering — Spearman",
+       subtitle = sprintf("rho = %.3f (p = %.2e), n = %d genes",
+                          cor_spearman_after$estimate,
+                          cor_spearman_after$p.value,
+                          nrow(gene_means_after))) +
+  theme_minimal(base_size = 13)
+
+p_aft_pear + p_aft_spear +
+  plot_annotation(title = "Per-Gene mRNA vs Protein (After Filtering)",
+                  subtitle = "Each dot = one gene at its mean expression across all samples")
+```
+
+
+# Protein–mRNA Correlation QC (Per-Gene, Across Samples)
+
+> **Aim:** For each gene, compute the Spearman correlation between its protein
+> and mRNA values across all samples. This gives one ρ per gene and answers:
+> "For this specific gene, do samples with higher mRNA also have higher
+> protein?" The distribution of these per-gene correlations characterises the
+> overall strength of transcriptional control in this dataset. The median ρ
+> is a key QC metric — it should be moderately positive (typically 0.3–0.5
+> for TMT proteomics).
+
+```{r step6-per-gene-cor, fig.height=6}
+stopifnot(identical(rownames(expr_filt), rownames(mrna_filt)))
+
+gene_cor <- vapply(seq_len(nrow(expr_filt)), function(i) {
+  cor(expr_filt[i, ], mrna_filt[i, ], method = "spearman",
+      use = "pairwise.complete.obs")
+}, numeric(1))
+names(gene_cor) <- rownames(expr_filt)
+
+gene_cor <- gene_cor[is.finite(gene_cor)]
+med_cor  <- median(gene_cor, na.rm = TRUE)
+
+par(mar = c(4.2, 4.2, 0.8, 1.0), mgp = c(2.4, 0.8, 0), tcl = -0.25,
+    cex.lab = 1.4, cex.axis = 1.0, bty = "l")
+hist(gene_cor, breaks = 50, col = "grey85", border = "grey70",
+     main = "", xlab = "Protein–mRNA correlation (Spearman rho)",
+     ylab = "Number of genes")
+abline(v = 0, col = "black", lwd = 2, lty = 3)
+abline(v = med_cor, col = "red3", lwd = 2.5, lty = 2)
+legend("topright",
+       legend = c("No correlation", sprintf("Median = %.2f", med_cor)),
+       col = c("black", "red3"), lwd = c(2, 2.5), lty = c(3, 2),
+       bty = "n", cex = 1.2, inset = 0.02)
+```
+
+## Diagnosing the Correlation Drop {.tabset}
+
+> **Aim:** The mean-expression Spearman correlation drops from ~0.39 (before
+> filtering, ~10,700 genes) to ~0.24 (after filtering, ~6,800 genes). We
+> investigate whether the presence filter selectively removes genes with
+> specific expression or correlation properties.
+
+### Classify Genes: Kept vs Filtered Out
+
+```{r classify-genes}
+kept_genes     <- rownames(expr_filt)
+all_genes_raw  <- rownames(prot_common_raw)
+filtered_genes <- setdiff(all_genes_raw, kept_genes)
+
+cat(sprintf("Total genes (before): %d\n", length(all_genes_raw)))
+cat(sprintf("Kept (after filtering): %d\n", length(kept_genes)))
+cat(sprintf("Filtered out: %d\n", length(filtered_genes)))
+
+# ── Compute mean expression per gene for classification ──
+density_df <- tibble(
+  gene         = all_genes_raw,
+  protein_mean = rowMeans(prot_common_raw, na.rm = TRUE),
+  mrna_mean    = rowMeans(mrna_common_raw, na.rm = TRUE),
+  group        = if_else(gene %in% kept_genes, "Kept", "Filtered out")
+) %>%
+  filter(is.finite(protein_mean) & is.finite(mrna_mean)) %>%
+  mutate(group = factor(group, levels = c("Kept", "Filtered out")))
+```
+
+### Density Plot 1: Whole Dataset — mRNA vs Protein Expression
+
+> **What this shows:** The distribution of mean mRNA and mean protein
+> expression across ALL genes before any filtering. Overlaying both on the
+> same plot reveals whether the two data types have similar dynamic ranges
+> and whether there is a subpopulation of genes with divergent mRNA and
+> protein levels.
+
+```{r density-all, fig.height=5}
+density_all <- density_df %>%
+  dplyr::select(gene, protein_mean, mrna_mean) %>%
+  pivot_longer(cols = c(protein_mean, mrna_mean),
+               names_to = "data_type", values_to = "mean_expr") %>%
+  mutate(data_type = recode(data_type,
+                            protein_mean = "Protein",
+                            mrna_mean    = "mRNA"))
+
+ggplot(density_all, aes(x = mean_expr, fill = data_type, colour = data_type)) +
+  geom_density(alpha = 0.3, linewidth = 0.8) +
+  scale_fill_manual(values = c("Protein" = "#E64B35", "mRNA" = "#4DBBD5")) +
+  scale_colour_manual(values = c("Protein" = "#E64B35", "mRNA" = "#4DBBD5")) +
+  labs(x = "Mean expression (across samples)",
+       y = "Density",
+       fill = NULL, colour = NULL,
+       title = "Whole Dataset: mRNA vs Protein Expression",
+       subtitle = sprintf("All %d genes before filtering", nrow(density_df))) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top")
+```
+
+### Density Plot 2: Filtered-Out Genes — mRNA vs Protein Expression
+
+> **What this shows:** The expression profile of the ~4,000 genes removed by
+> the filtering pipeline. The key question is the relative position of the
+> mRNA and protein densities. If both shift left equally (low mRNA, low
+> protein), these are simply lowly-expressed genes. If protein shifts left
+> but mRNA stays central or shifts right (high mRNA, low protein), these
+> genes are candidates for post-transcriptional suppression — and the filter
+> is removing exactly the genes we might care about most.
+
+```{r density-filtered, fig.height=5}
+density_filt_out <- density_df %>%
+  filter(group == "Filtered out") %>%
+  dplyr::select(gene, protein_mean, mrna_mean) %>%
+  pivot_longer(cols = c(protein_mean, mrna_mean),
+               names_to = "data_type", values_to = "mean_expr") %>%
+  mutate(data_type = recode(data_type,
+                            protein_mean = "Protein",
+                            mrna_mean    = "mRNA"))
+
+ggplot(density_filt_out, aes(x = mean_expr, fill = data_type, colour = data_type)) +
+  geom_density(alpha = 0.3, linewidth = 0.8) +
+  scale_fill_manual(values = c("Protein" = "#E64B35", "mRNA" = "#4DBBD5")) +
+  scale_colour_manual(values = c("Protein" = "#E64B35", "mRNA" = "#4DBBD5")) +
+  labs(x = "Mean expression (across samples)",
+       y = "Density",
+       fill = NULL, colour = NULL,
+       title = "Filtered-Out Genes: mRNA vs Protein Expression",
+       subtitle = sprintf("%d genes removed by filtering",
+                          sum(density_df$group == "Filtered out"))) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top")
+```
+
+### Density Plot 3: Kept Genes — mRNA vs Protein Expression
+
+> **What this shows:** The expression profile of the ~6,800 genes retained
+> after filtering. Comparing this with the filtered-out plot (above) reveals
+> whether the kept genes have a systematically different mRNA-protein
+> relationship. If the mRNA and protein densities are more overlapping here
+> than in the filtered-out set, the kept genes have tighter transcriptional
+> coupling (mRNA ≈ protein). If the mRNA density is wider or shifted
+> differently, post-transcriptional control plays a different role.
+
+```{r density-kept, fig.height=5}
+density_kept <- density_df %>%
+  filter(group == "Kept") %>%
+  dplyr::select(gene, protein_mean, mrna_mean) %>%
+  pivot_longer(cols = c(protein_mean, mrna_mean),
+               names_to = "data_type", values_to = "mean_expr") %>%
+  mutate(data_type = recode(data_type,
+                            protein_mean = "Protein",
+                            mrna_mean    = "mRNA"))
+
+ggplot(density_kept, aes(x = mean_expr, fill = data_type, colour = data_type)) +
+  geom_density(alpha = 0.3, linewidth = 0.8) +
+  scale_fill_manual(values = c("Protein" = "#E64B35", "mRNA" = "#4DBBD5")) +
+  scale_colour_manual(values = c("Protein" = "#E64B35", "mRNA" = "#4DBBD5")) +
+  labs(x = "Mean expression (across samples)",
+       y = "Density",
+       fill = NULL, colour = NULL,
+       title = "Kept Genes: mRNA vs Protein Expression",
+       subtitle = sprintf("%d genes retained after filtering",
+                          sum(density_df$group == "Kept"))) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top")
+```
+
+### Per-Gene Spearman Rho: Kept vs Filtered Out
+
+> **What this shows:** Do the filtered-out genes have different mRNA-protein
+> coupling than the kept genes? If filtered-out genes have higher per-gene
+> rho, the filter is removing transcriptionally-controlled genes. If lower,
+> the filtered-out genes are noisy. If the same, the filtering
+> does not selectively act on the strength of within-gene mRNA-protein
+> coupling.
+
+```{r density-rho, fig.height=5}
+rho_all <- vapply(seq_len(nrow(prot_common_raw)), function(i) {
+  cor(prot_common_raw[i, ], mrna_common_raw[i, ],
+      method = "spearman", use = "pairwise.complete.obs")
+}, numeric(1))
+names(rho_all) <- rownames(prot_common_raw)
+
+rho_df <- tibble(
+  gene  = names(rho_all),
+  rho   = rho_all,
+  group = if_else(gene %in% kept_genes, "Kept", "Filtered out")
+) %>%
+  filter(is.finite(rho)) %>%
+  mutate(group = factor(group, levels = c("Kept", "Filtered out")))
+
+med_kept <- median(rho_df$rho[rho_df$group == "Kept"], na.rm = TRUE)
+med_filt <- median(rho_df$rho[rho_df$group == "Filtered out"], na.rm = TRUE)
+
+ggplot(rho_df, aes(x = rho, fill = group, colour = group)) +
+  geom_density(alpha = 0.3, linewidth = 0.8) +
+  geom_vline(xintercept = med_kept, colour = "steelblue",
+             linewidth = 1, linetype = "dashed") +
+  geom_vline(xintercept = med_filt, colour = "#E64B35",
+             linewidth = 1, linetype = "dashed") +
+  scale_fill_manual(values = c("Kept" = "steelblue", "Filtered out" = "#E64B35")) +
+  scale_colour_manual(values = c("Kept" = "steelblue", "Filtered out" = "#E64B35")) +
+  labs(x = "Per-gene Spearman rho (protein vs mRNA across samples)",
+       y = "Density",
+       fill = NULL, colour = NULL,
+       title = "Per-Gene mRNA-Protein Correlation: Kept vs Filtered Out",
+       subtitle = sprintf("Median rho — Kept: %.3f, Filtered out: %.3f",
+                          med_kept, med_filt)) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top")
+
+wt_rho <- wilcox.test(rho ~ group, data = rho_df)
+cat(sprintf("Wilcoxon test (rho: Kept vs Filtered out): p = %.2e\n", wt_rho$p.value))
+```
+
+### Summary Table: Kept vs Filtered Out
+
+```{r density-summary}
+density_df %>%
+  group_by(group) %>%
+  summarise(
+    n           = n(),
+    med_protein = median(protein_mean, na.rm = TRUE),
+    med_mrna    = median(mrna_mean, na.rm = TRUE),
+    .groups     = "drop"
+  ) %>%
+  left_join(
+    rho_df %>% group_by(group) %>%
+      summarise(med_rho = median(rho, na.rm = TRUE), .groups = "drop"),
+    by = "group"
+  ) %>%
+  kable(digits = 3,
+        col.names = c("Group", "N genes", "Median protein", "Median mRNA",
+                       "Median per-gene rho"),
+        caption = "Expression and correlation properties: kept vs filtered-out genes") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+### Permutation Test: Is the Correlation Drop Real?
+
+> **Aim:** Test whether the drop in mean-expression Spearman correlation
+> (from ~0.39 to ~0.24 after filtering) is explained by having fewer genes,
+> or whether the filter selectively removes genes that anchored the
+> correlation.
+>
+> **How it works:** We randomly sample the same number of genes as the
+> post-filter set (n ≈ 6,800) from the full pre-filter gene set (n ≈ 10,700)
+> — ignoring any expression-based criterion — and compute the Spearman
+> correlation of mean mRNA vs mean protein across those randomly chosen
+> genes. This is repeated 1,000 times to build a null distribution. The
+> permutation acts on **gene identity** (which mRNA-protein pairs are
+> included), not on sample labels or expression values.
+>
+> If the observed post-filter correlation falls within this null distribution,
+> the drop is a sample-size artefact. If it falls significantly below (left
+> tail), the filter is selectively removing genes that contributed
+> disproportionately to the correlation.
+
+```{r permutation-test, fig.height=5}
+set.seed(42)
+
+n_after <- sum(density_df$group == "Kept")
+n_perms <- 1000
+
+perm_cors_spearman <- numeric(n_perms)
+
+for (i in seq_len(n_perms)) {
+  idx <- sample(seq_len(nrow(gene_means_before)), size = n_after, replace = FALSE)
+  sub <- gene_means_before[idx, ]
+  perm_cors_spearman[i] <- cor(sub$mrna_mean, sub$protein_mean, method = "spearman")
+}
+
+obs_spearman <- cor_spearman_after$estimate
+p_perm       <- mean(perm_cors_spearman <= obs_spearman)
+
+par(mar = c(4.2, 4.2, 2, 1), cex.lab = 1.2, cex.axis = 1.0, bty = "l")
+hist(perm_cors_spearman, breaks = 40, col = "grey85", border = "grey70",
+     main = "Permutation Test: Spearman rho",
+     xlab = "Correlation (random gene subset)",
+     ylab = "# permutations")
+abline(v = obs_spearman, col = "red3", lwd = 2.5, lty = 2)
+abline(v = cor_spearman_before$estimate, col = "steelblue", lwd = 2, lty = 3)
+legend("topleft",
+       legend = c(sprintf("Observed (filtered) = %.3f", obs_spearman),
+                  sprintf("Full dataset = %.3f", cor_spearman_before$estimate),
+                  sprintf("Perm. median = %.3f", median(perm_cors_spearman))),
+       col = c("red3", "steelblue", "grey50"),
+       lwd = c(2.5, 2, 1), lty = c(2, 3, 1),
+       bty = "n", cex = 0.9)
+
+cat(sprintf("Permutation test (n = %d):\n", n_perms))
+cat(sprintf("  Observed (filtered): %.3f\n", obs_spearman))
+cat(sprintf("  Permutation median:  %.3f\n", median(perm_cors_spearman)))
+cat(sprintf("  p(random <= observed): %.3f\n", p_perm))
+```
+
+```{r permutation-interpretation, results='asis'}
+if (p_perm < 0.05) {
+  cat("> **Interpretation:** The observed post-filter correlation is significantly\n")
+  cat("> lower than expected from random subsets of the same size (p < 0.05).\n")
+  cat("> The presence filter selectively removes genes that contributed to the\n")
+  cat("> mRNA-protein correlation. The density plots above clarify whether\n")
+  cat("> those genes had a specific expression profile (e.g., jointly low\n")
+  cat("> mRNA and protein anchoring the bottom-left of the scatter).\n")
+} else {
+  cat("> **Interpretation:** The observed post-filter correlation falls within the\n")
+  cat("> range of random subsets (p >= 0.05). The correlation drop is largely\n")
+  cat("> explained by having fewer genes, not by biological differences between\n")
+  cat("> kept and removed genes.\n")
+}
+```
+
+# Filtering Summary
+
+> **Aim:** Compile a summary table showing how many proteins/genes survive
+> each stage, plus the before/after correlation comparison.
+
+```{r filter-summary}
+tribble(
+  ~Stage,                      ~Proteins,          ~Genes_mRNA,
+  "Raw",                       nrow(expr),         nrow(mrna),
+  "After presence (≥95%)",     n_after_presence,   NA_integer_,
+  "After IQR (top 90%)",       n_after_iqr,        NA_integer_,
+  "After MAD (top 95%)",       n_after_mad,        NA_integer_,
+  "After mRNA IQR (top 95%)",  n_after_mad,        n_after_mrna_iqr,
+  "Final (matched)",           nrow(expr_filt),    nrow(expr_filt)
+) %>%
+  kable(caption = "Feature counts at each filtering stage") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+tribble(
+  ~Stage,                  ~N_genes,                  ~Pearson_r,                        ~Spearman_rho,
+  "Before filtering",      nrow(gene_means_before),   cor_pearson_before$estimate,        cor_spearman_before$estimate,
+  "After filtering",       nrow(gene_means_after),    cor_pearson_after$estimate,         cor_spearman_after$estimate
+) %>%
+  kable(digits = 3,
+        col.names = c("Stage", "N genes", "Pearson r", "Spearman rho"),
+        caption = "mRNA–protein correlation (mean expression across genes): before vs after filtering") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+tribble(
+  ~Stage,              ~N_genes,                   ~Median_rho,
+  "Before filtering",  length(gene_cor_before),    med_cor_before,
+  "After filtering",   length(gene_cor),           med_cor
+) %>%
+  kable(digits = 3,
+        col.names = c("Stage", "N genes", "Median Spearman rho"),
+        caption = "Per-gene mRNA–protein correlation (across samples): before vs after filtering") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+
+# Interpretation and conclusions:
+
+>1. Permutation test: The cross-gene correlation drop (0.395 → 0.249) is not a sample-size artefact — 0/1,000 random subsets produced a correlation that low. The filter selectively removes genes that anchored the mean-expression correlation.
+2. Density plots: The filtered-out genes are low in both mRNA and protein, but critically, the protein density is sharper and more compressed near zero than the mRNA density. These jointly-low genes provided the bottom-left anchor points in the scatter plot. Removing them collapses the expression range and drops the cross-gene correlation. The kept genes show a similar mRNA-protein gap but with the low-expression tail trimmed.
+3. Per-gene rho: This is the most informative result. The kept genes have higher within-gene mRNA-protein coupling (median ρ = 0.589) than the filtered-out genes (0.475). The filtered-out genes are not just low-expression — they are genuinely noisier at the within-gene level. This could reflect two things: (a) technical noise from measuring near the detection limit makes per-gene correlations unreliable, or (b) some of these genes truly have weaker transcriptional control, but you can't distinguish this from measurement noise when protein is barely detectable.
+Combined interpretation: The filtering removes genes that are both lowly expressed and have weaker within-gene mRNA-protein coupling. The correlation drop from 0.395 to 0.249 is driven by two additive effects — loss of low-expression leverage points (density plots) AND preferential retention of genes with stronger per-gene coupling (rho plot). The kept genes are not more post-transcriptionally regulated — if anything, they are more transcriptionally controlled (higher rho), which is actually favourable for your LASSO framework: a stronger Step 0 OLS fit means cleaner residuals, which means the LASSO is working on genuine post-transcriptional signal rather than noise contaminated residuals.
+
+
+
+# Save Filtered Matrices
+
+> **Aim:** Save the final filtered and matched protein and mRNA matrices
+> as RDS files for use in downstream LASSO modelling.
+
+```{r save}
+saveRDS(expr_filt, paste0(data_dir,"Data/20260413_Satpathy_prot_filt_YP.RDS"))
+saveRDS(mrna_filt, paste0(data_dir,"Data/20260413_Satpathy_mrna_filt_YP.RDS"))
+
+cat(sprintf("Saved: %d genes × %d samples\n", nrow(expr_filt), ncol(expr_filt)))
+```
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
