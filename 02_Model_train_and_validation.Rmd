@@ -1,0 +1,2173 @@
+---
+title: "Extended Analysis: Post-Transcriptional Regulation in LSCC"
+subtitle: "Satpathy 2021 — Residual-based LASSO discovery of protein regulators"
+author: "Yashna Paul"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    code_folding: hide
+    theme: flatly
+    number_sections: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  warning    = FALSE,
+  message    = FALSE,
+  fig.width  = 10,
+  fig.height = 7,
+  fig.align  = "center",
+  cache      = TRUE
+)
+```
+
+
+# Setup {.tabset}
+
+> **Aim:** Load all required R packages, define file paths, and set up
+> reusable helper functions (plotting theme, imputation, scaling). This
+> section contains no analysis — it only prepares the environment. All file
+> paths are centralised here. Edit one chunk to
+> adapt the report to their directory structure.
+
+## Libraries
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(glmnet)
+  library(matrixStats)
+  library(tidyverse)  
+  library(readxl)
+  library(knitr)
+  library(kableExtra)
+  library(topGO)
+  library(org.Hs.eg.db)
+  library(pheatmap)
+  library(ggrepel)
+  library(viridis)
+  library(RColorBrewer)
+  library(patchwork)
+})
+
+set.seed(42)
+```
+
+## File Paths
+
+> Update every path below to match your local
+> directory layout. The report assumes that 01_filter_and_QC_trainingData_Satpathy.rmd has already been run and the filtered RDS matrices exist.
+Filter_data.R takes the raw protein and mRNA matrices, applies sequential filters (presence ≥95%, protein IQR top 90%, protein MAD top 95%, mRNA IQR top 95%), matches common genes and samples between the two, runs a per-gene protein–mRNA correlation QC, and saves the filtered matrices as RDS files for downstream LASSO modelling.
+> External validation datasets (unfiltered RDS files) must also be present.
+> origin of 5'TOP genes: supplementary table 1: https://www.pnas.org/doi/10.1073/pnas.1912864117
+> origin of mTOR and ERK pathway genes: L1000 database, a transcriptomic database of human cell lines subjected to short-term exposure to chemical inhibitors or activators targeting specific proteins. 
+ Positive Marker Genes: Expression levels decrease in response to mTOR/ERK inhibition.
+ Negative Marker Genes: Expression levels increase in response to mTOR/ERK inhibition.
+
+
+```{r paths}
+
+#--- Project directory --
+
+
+# ── Raw data ──
+data_dir <- "/cellfile/DATASETS/Human/Multi-tissue/Multi_omics/Public/LamanTripEtAl2025_processedMatrices/"
+
+#data_dir <- "/cellfile/datapublic/keisele1/Projectmodule/"
+raw_prot_tumor   <- file.path(data_dir,"Data/lung_satpathy2021_prot_tumor.csv")
+raw_rna_tumor    <- file.path(data_dir,"Data/lung_satpathy2021_rna_tumor_idfix_subsetted.csv")
+raw_prot_healthy <- file.path(data_dir,"Data/lung_satpathy2021_prot_healthy.csv")
+raw_rna_healthy  <- file.path(data_dir,"Data/lung_satpathy2021_rna_healthy.csv")
+metadata_path    <- file.path(data_dir,"Meta-data/metadata_satpathy.xlsx")
+
+# ── Filtered matrices (output of Filter_data.R) ──
+filt_prot_path <- file.path(data_dir,"Data/20260413_Satpathy_prot_filt_YP.RDS")
+filt_mrna_path <- file.path(data_dir,"Data/20260413_Satpathy_mrna_filt_YP.RDS")
+
+# ── External validation datasets (unfiltered, genes × samples) ──
+# Each pair is a protein and mRNA matrix as RDS.
+# Update names/paths to match your actual external cohorts.
+ext_test_sets <- tibble(
+  dataset      = c("Dong (Liver Tumour)", "Jiang (Liver Tumour)",
+                    "Jiang (Liver Healthy)", "Xu (Lung Tumour)",
+                    "Xu (Lung Healthy)", "Gilette (Lung Tumour)"),
+  protein_path = file.path(data_dir, c("Data/liver_dong2022_prot_tumor.csv"
+                                    ,  "Data/liver_jiang2019_prot_tumor.csv"
+                                    ,  "Data/liver_jiang2019_prot_healthy.csv"
+                                    ,  "Data/lung_xu2020_prot_tumor.csv"
+                                    ,  "Data/lung_xu2020_prot_tumor.csv"
+                                    ,  "Data/lung_gilette2020_prot_tumor.csv")),
+  mrna_path    = file.path(data_dir, c("Data/liver_dong2022_rna_tumor_idfix_subsetted.csv"
+                                   ,   "Data/liver_jiang2019_rna_tumor_idfix_subsetted.csv"
+                                   ,   "Data/liver_gao2019_rna_healthy.csv"
+                                   ,   "Data/lung_xu2020_rna_tumor_idfix_subsetted.csv"
+                                   ,   "Data/lung_xu2020_rna_healthy.csv"
+                                   ,   "Data/lung_gilette2020_rna_tumor_idfix_subsetted.csv"))
+)
+
+# ── Gene lists ──
+gene_list_dir <- "/cellfile/datapublic/ypaul1/KatrinprojectModule"
+
+top_genes_path       <- file.path(gene_list_dir, "5prime_TOP")
+erk_neg_path         <- file.path(gene_list_dir, "250728_erk_negative_MW.csv")
+erk_pos_path         <- file.path(gene_list_dir, "250728_erk_positive_MW.csv")
+mtor_neg_path        <- file.path(gene_list_dir, "250728_mtor_negative_MW.csv")
+mtor_pos_path        <- file.path(gene_list_dir, "250728_mtor_positive_MW.csv")
+
+
+# ── Output directory ──
+results_dir <- "/cellfile/datapublic/ypaul1/KatrinprojectModule/results_extended"
+dir.create(results_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+## Custom Theme & Helpers
+
+> Defines a consistent ggplot theme used throughout, colour palettes for the
+> three models and for positive/negative regulators, and utility functions
+> for imputation, scaling, and histogram plotting. These are called
+> repeatedly in later sections.
+
+```{r theme-helpers}
+theme_report <- function(base_size = 13) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      panel.grid.minor   = element_blank(),
+      panel.grid.major   = element_line(linewidth = 0.3, colour = "grey90"),
+      axis.title         = element_text(face = "plain"),
+      legend.title       = element_text(face = "bold"),
+      strip.text         = element_text(face = "bold"),
+      plot.title         = element_text(face = "bold", size = base_size + 1),
+      plot.subtitle      = element_text(colour = "grey40")
+    )
+}
+
+model_colours <- c(
+  "A: residuals ~ proteins" = "#E64B35",
+  "B: residuals ~ mRNAs"    = "#4DBBD5",
+  "C: permuted baseline"    = "#91D1C2"
+)
+
+sign_colours <- c("positive" = "firebrick", "negative" = "deepskyblue")
+
+impute_with_train_means <- function(M, train_ref) {
+  cm <- colMeans(train_ref, na.rm = TRUE)
+  cm[!is.finite(cm)] <- 0
+  for (j in seq_len(ncol(M))) {
+    nas <- is.na(M[, j])
+    if (any(nas)) M[nas, j] <- cm[j]
+  }
+  M
+}
+
+scale_with_train <- function(M, train_ref) {
+  mu  <- colMeans(train_ref, na.rm = TRUE)
+  sdv <- apply(train_ref, 2, sd, na.rm = TRUE)
+  sdv[!is.finite(sdv) | sdv == 0] <- 1
+  sweep(sweep(M, 2, mu, "-"), 2, sdv, "/")
+}
+
+hist_qc <- function(x, breaks = 100, xlab, ylab, vline = NULL, vlab = NULL,
+                    fill_col = "grey85", border_col = "grey70") {
+  df <- tibble(val = x)
+  p <- ggplot(df, aes(x = val)) +
+    geom_histogram(bins = breaks, fill = fill_col, colour = border_col,
+                   linewidth = 0.2) +
+    labs(x = xlab, y = ylab) +
+    theme_report()
+  if (!is.null(vline)) {
+    p <- p +
+      geom_vline(xintercept = vline, colour = "red3", linewidth = 1,
+                 linetype = "dashed") +
+      annotate("text", x = vline, y = Inf, label = vlab,
+               vjust = 2, hjust = -0.1, colour = "red3", size = 4)
+  }
+  p
+}
+```
+
+
+# Load Data
+
+> **Aim:** Load the filtered protein and mRNA matrices produced by Katrin's
+> `Filter_data.R` pipeline. These matrices have already undergone presence
+> filtering (≥ 95% detection), protein IQR filtering (bottom 10% removed),
+> MAD filtering (bottom 5% removed), mRNA IQR filtering (bottom 5% removed),
+> and gene/sample matching. They are the starting point for all modelling.
+> We also load sample-level metadata (age, sex, stage, smoking, molecular
+> subtype) for PCA colouring and covariate checks.
+
+```{r load-data}
+protein_mat <- readRDS(filt_prot_path)
+mrna_mat    <- readRDS(filt_mrna_path)
+
+mrna_mat <- mrna_mat[rownames(protein_mat), colnames(protein_mat), drop = FALSE]
+stopifnot(identical(dim(protein_mat), dim(mrna_mat)))
+
+genes     <- rownames(protein_mat)
+n_genes   <- length(genes)
+n_samples <- ncol(protein_mat)
+
+cat("Filtered data:", n_genes, "genes ×", n_samples, "samples\n")
+```
+
+```{r load-metadata}
+meta_raw <- read_excel(metadata_path, sheet = "Table S1A")
+
+meta <- meta_raw %>%
+  transmute(
+    sample_id = Sample.ID,
+    type      = Type,
+    age       = Age,
+    sex       = Gender,
+    stage     = Stage_mod,
+    smoking   = Smoking.History_modified,
+    ethnicity = Ethnicity_mod,
+    nmf       = NMF.subtype,
+    country   = Country.of.Origin
+  )
+```
+
+
+# Data Overview
+
+> **Aim:** Provide a concise summary of dataset dimensions at each filtering
+> stage. This table documents how many proteins/genes and samples survive each
+> filter, serving as a sanity check that no unexpected loss occurred. We also
+> report the fraction of missing values (NAs) in both matrices, which informs
+> the imputation strategy used later.
+
+```{r data-overview}
+raw_prot <- read_csv(raw_prot_tumor, show_col_types = FALSE)
+raw_rna  <- read_csv(raw_rna_tumor,  show_col_types = FALSE)
+
+tribble(
+  ~Matrix,                ~Genes,            ~Samples,
+  "Raw protein (tumour)", nrow(raw_prot),    ncol(raw_prot) - 1,
+  "Raw mRNA (tumour)",    nrow(raw_rna),     ncol(raw_rna) - 1,
+  "Filtered protein",     nrow(protein_mat), ncol(protein_mat),
+  "Filtered mRNA",        nrow(mrna_mat),    ncol(mrna_mat),
+  "Common (final)",       n_genes,           n_samples
+) %>%
+  kable(caption = "Dataset dimensions at each processing stage",
+        format.args = list(big.mark = ",")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+cat(sprintf("Protein NA fraction: %.3f%%\nmRNA NA fraction: %.3f%%\n",
+            mean(is.na(protein_mat)) * 100, mean(is.na(mrna_mat)) * 100))
+
+rm(raw_prot, raw_rna); gc(verbose = FALSE)
+```
+
+
+# Filtering QC
+
+> **Aim:** Reproduce and visualise Katrin's four-step filtering pipeline to
+> document the effect of each filter on feature count. This is not re-running
+> the filter (the filtered matrices are already loaded); rather, it re-applies
+> the same logic to the raw data for documentation purposes, showing the
+> distribution of each metric and where the cutoff falls. This ensures
+> transparency and reproducibility.
+
+## Presence Filter
+
+> **What it does:** Removes proteins that fall below the global 5th-percentile
+> expression threshold in more than 5% of samples. Proteins that are "present"
+> in fewer than 95% of samples are unreliable — their apparent variability
+> may be driven by missingness patterns rather than genuine biology. This is
+> the most aggressive filter and typically removes ~40–50% of the initial
+> protein catalogue.
+
+```{r presence-filter, fig.height=5}
+raw_prot <- read_csv(raw_prot_tumor, show_col_types = FALSE)
+expr_raw <- raw_prot %>% dplyr::select(where(is.numeric)) %>% as.matrix()
+rownames(expr_raw) <- raw_prot$symbol
+
+expr_q05 <- quantile(expr_raw, 0.05, na.rm = TRUE)
+presence <- rowMeans(expr_raw > expr_q05, na.rm = TRUE)
+
+p1 <- hist_qc(as.vector(expr_raw), breaks = 500,
+               xlab = "Expression value", ylab = "Frequency",
+               vline = expr_q05,
+               vlab = sprintf("5%% threshold = %.2f", expr_q05)) +
+  coord_cartesian(xlim = c(-10, 10))
+
+p2 <- hist_qc(presence, breaks = 100,
+               xlab = "Fraction samples above threshold", ylab = "# proteins",
+               vline = 0.95, vlab = "Presence cutoff = 0.95")
+
+p1 / p2 + plot_annotation(
+  title = "Presence Filter",
+  subtitle = sprintf("%d → %d proteins", nrow(expr_raw), sum(presence >= 0.95)))
+
+expr_pres <- expr_raw[presence >= 0.95, , drop = FALSE]
+```
+
+## IQR Filter (Protein)
+
+> **What it does:** Removes the bottom 10% of proteins by interquartile range
+> (IQR). Proteins with near-zero IQR have essentially constant expression
+> across samples and carry no discriminative signal for the LASSO. IQR is
+> preferred over variance or standard deviation because it is robust to
+> outliers — a single extreme sample will not inflate the spread estimate and
+> rescue a genuinely flat protein from removal.
+
+```{r iqr-filter-prot, fig.height=4}
+iqr_vals <- apply(expr_pres, 1, IQR, na.rm = TRUE)
+iqr_cut  <- quantile(iqr_vals, 0.10, na.rm = TRUE)
+
+hist_qc(iqr_vals, xlab = "IQR across samples", ylab = "# proteins",
+        vline = iqr_cut,
+        vlab = sprintf("IQR cutoff (10%%) = %.2f", iqr_cut)) +
+  labs(title = "Protein IQR Filter",
+       subtitle = sprintf("%d → %d", nrow(expr_pres), sum(iqr_vals > iqr_cut)))
+
+expr_iqr <- expr_pres[iqr_vals > iqr_cut, , drop = FALSE]
+```
+
+## MAD Filter (Protein)
+
+> **What it does:** Removes the bottom 5% of proteins by median absolute
+> deviation (MAD). This is a second robustness layer that catches proteins
+> which passed the IQR filter but still have very low dispersion around
+> the median. For example, a protein with a tight IQR but one extreme outlier
+> inflating its range would pass IQR but fail MAD. This conservative cleanup
+> removes very few additional proteins.
+
+```{r mad-filter, fig.height=4}
+mad_vals <- rowMads(expr_iqr, na.rm = TRUE)
+mad_cut  <- quantile(mad_vals, 0.05, na.rm = TRUE)
+
+hist_qc(mad_vals, xlab = "MAD across samples", ylab = "# proteins",
+        vline = mad_cut,
+        vlab = sprintf("MAD cutoff (5%%) = %.2f", mad_cut)) +
+  labs(title = "Protein MAD Filter",
+       subtitle = sprintf("%d → %d", nrow(expr_iqr), sum(mad_vals > mad_cut)))
+
+rm(expr_raw, expr_pres, expr_iqr); gc(verbose = FALSE)
+```
+
+## IQR Filter (mRNA)
+
+> **What it does:** Removes the bottom 5% of mRNA features by IQR. This
+> ensures that both the OLS residualisation step (Step 0) and Model B
+> (residuals ~ other mRNAs) have predictors with sufficient cross-sample
+> variability. A more lenient cutoff (5% vs 10% for proteins) is used because
+> mRNA data typically has fewer near-zero-variance features.
+
+```{r iqr-filter-mrna, fig.height=4}
+raw_rna  <- read_csv(raw_rna_tumor, show_col_types = FALSE)
+mrna_raw <- raw_rna %>% dplyr::select(where(is.numeric)) %>% as.matrix()
+rownames(mrna_raw) <- raw_rna$symbol
+
+mrna_iqr     <- apply(mrna_raw, 1, IQR, na.rm = TRUE)
+iqr_cut_mrna <- quantile(mrna_iqr, 0.05, na.rm = TRUE)
+
+hist_qc(mrna_iqr, xlab = "IQR across samples", ylab = "# genes",
+        vline = iqr_cut_mrna,
+        vlab = sprintf("IQR cutoff (5%%) = %.2f", iqr_cut_mrna)) +
+  labs(title = "mRNA IQR Filter",
+       subtitle = sprintf("%d → %d", nrow(mrna_raw), sum(mrna_iqr > iqr_cut_mrna)))
+
+rm(raw_prot, raw_rna, mrna_raw); gc(verbose = FALSE)
+```
+
+
+# Sample-Level QC {.tabset}
+
+> **Aim:** Identify technical outlier samples before modelling. Outlier samples
+> bias model training (if they fall into training folds) and inflate test-set
+> error (if they fall into test folds). Two complementary approaches are used:
+>
+> 1. **PCA** — projects all samples into a low-dimensional space. If technical
+>    variables (TMT plex, batch) dominate PC1/PC2, the data may need batch
+>    correction. If biological variables (stage, subtype) dominate, the data
+>    is well-behaved.
+> 2. **Per-sample mRNA–protein correlation** — computes the Spearman ρ
+>    between all protein and mRNA values within each sample. A normal sample
+>    should show moderate positive ρ. Abnormally low ρ suggests a sample
+>    swap, RNA/protein degradation, or failed measurement.
+
+## PCA by Metadata
+
+> **What this shows:** The scree plot reveals how many PCs carry meaningful
+> variance (guiding dimensionality interpretation). The coloured scatter plots
+> reveal whether biological or technical variables drive the dominant axes of
+> variation. Ideally, biological variables (molecular subtype, stage) should
+> separate samples, while technical variables (sex, country) should not
+> produce strong clustering unless they are confounded with biology.
+
+```{r pca-qc, fig.height=6}
+mat_imp <- t(apply(protein_mat, 1, function(x) {
+  x[!is.finite(x)] <- NA_real_
+  x[is.na(x)] <- median(x, na.rm = TRUE)
+  x
+}))
+
+pca <- prcomp(t(mat_imp), center = TRUE, scale. = FALSE)
+var_expl <- (pca$sdev^2) / sum(pca$sdev^2)
+
+pca_df <- tibble(sample_id = colnames(protein_mat),
+                 PC1 = pca$x[, 1], PC2 = pca$x[, 2], PC3 = pca$x[, 3]) %>%
+  left_join(meta, by = "sample_id")
+
+ggplot(tibble(PC = 1:20, var = var_expl[1:20] * 100), aes(PC, var)) +
+  geom_col(fill = "steelblue", width = 0.7) +
+  geom_line(colour = "grey30") + geom_point(size = 2) +
+  labs(x = "Principal Component", y = "% Variance Explained",
+       title = "Scree Plot",
+       subtitle = "How many PCs carry meaningful variance?") +
+  theme_report()
+```
+
+```{r pca-panels, fig.height=12, fig.width=10}
+vars_to_plot <- intersect(c("sex", "stage", "smoking", "nmf", "country"),
+                          colnames(pca_df))
+
+pca_plots <- lapply(vars_to_plot, function(v) {
+  ggplot(pca_df %>% filter(!is.na(.data[[v]])),
+         aes(PC1, PC2, colour = .data[[v]])) +
+    geom_point(size = 2.5, alpha = 0.8) +
+    labs(x = sprintf("PC1 (%.1f%%)", var_expl[1] * 100),
+         y = sprintf("PC2 (%.1f%%)", var_expl[2] * 100),
+         colour = v, title = paste("Coloured by", v)) +
+    theme_report(11)
+})
+
+wrap_plots(pca_plots, ncol = 2) +
+  plot_annotation(title = "PCA: Sample-Level Structure",
+                  subtitle = "Filtered protein matrix — Satpathy 2021 tumour samples")
+```
+
+## Per-Sample mRNA–Protein Correlation
+
+> **What this answers:** Is there a sample where the protein-mRNA relationship
+> has broken down? For each sample, we compute the Spearman ρ between its
+> protein and mRNA values across all genes. A well-behaved sample typically
+> shows ρ ≈ 0.3–0.6. Samples below the Tukey outlier threshold (Q1 − 1.5×IQR)
+> are flagged. Flagged samples are not automatically removed but should be
+> investigated — if they cluster by a metadata variable, the problem may be
+> systematic (e.g., degradation in samples from a specific site).
+
+```{r per-sample-cor, fig.height=5}
+sample_cors <- vapply(seq_len(n_samples), function(j) {
+  p <- protein_mat[, j]; m <- mrna_mat[, j]
+  ok <- is.finite(p) & is.finite(m)
+  if (sum(ok) < 30) return(NA_real_)
+  cor(p[ok], m[ok], method = "spearman")
+}, numeric(1))
+names(sample_cors) <- colnames(protein_mat)
+
+sample_cor_df <- tibble(sample_id = names(sample_cors), rho = sample_cors) %>%
+  left_join(meta, by = "sample_id")
+
+med_cor <- median(sample_cors, na.rm = TRUE)
+outlier_threshold <- quantile(sample_cors, 0.25, na.rm = TRUE) -
+                     1.5 * IQR(sample_cors, na.rm = TRUE)
+
+ggplot(sample_cor_df, aes(x = rho)) +
+  geom_histogram(bins = 30, fill = "steelblue", colour = "black",
+                 alpha = 0.7, linewidth = 0.2) +
+  geom_vline(xintercept = med_cor, colour = "red3",
+             linewidth = 1, linetype = "dashed") +
+  geom_vline(xintercept = outlier_threshold, colour = "orange",
+             linewidth = 1, linetype = "dotted") +
+  annotate("text", x = med_cor, y = Inf,
+           label = sprintf("Median = %.3f", med_cor),
+           vjust = 2, hjust = -0.1, colour = "red3", size = 3.5) +
+  annotate("text", x = outlier_threshold, y = Inf,
+           label = sprintf("Outlier cutoff = %.3f", outlier_threshold),
+           vjust = 3.5, hjust = -0.1, colour = "orange", size = 3.5) +
+  labs(x = "Per-sample Spearman ρ (protein vs mRNA across genes)",
+       y = "# samples",
+       title = "Per-Sample mRNA–Protein Correlation",
+       subtitle = "Low values may indicate technical artefacts or sample swaps") +
+  theme_report()
+```
+
+```{r outlier-samples}
+outlier_samples <- sample_cor_df %>%
+  filter(rho < outlier_threshold | is.na(rho)) %>% arrange(rho)
+
+if (nrow(outlier_samples) > 0) {
+  outlier_samples %>%
+    dplyr::select(sample_id, rho, sex, stage, smoking) %>%
+    kable(digits = 3, caption = "Flagged outlier samples (ρ below Tukey threshold)") %>%
+    kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+} else {
+  cat("✓ No outlier samples detected.\n")
+}
+```
+
+> **Follow-up:** Do outlier samples cluster by any metadata variable? If so,
+> the issue may be technical (e.g., a specific TMT plex) rather than random.
+
+```{r sample-cor-covariates, fig.height=5, fig.width=12}
+p_cor_boxes <- lapply(c("sex", "stage", "smoking"), function(v) {
+  ggplot(sample_cor_df %>% filter(!is.na(.data[[v]])),
+         aes(.data[[v]], rho, fill = .data[[v]])) +
+    geom_boxplot(width = 0.6, alpha = 0.7, outlier.alpha = 0.5) +
+    geom_jitter(width = 0.15, size = 1, alpha = 0.4) +
+    labs(x = v, y = "Spearman ρ", title = paste("By", v)) +
+    theme_report(11) +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 30, hjust = 1))
+})
+wrap_plots(p_cor_boxes, ncol = 3)
+```
+
+## Per-Gene mRNA–Protein Correlation
+
+> **What this answers:** How strongly does mRNA predict protein across samples,
+> on a gene-by-gene basis? This distribution characterises the overall strength
+> of transcriptional control in this tissue/tumour type. The median ρ tells us
+> what fraction of protein variance is typically explained by mRNA. Genes in
+> the left tail (low or negative ρ) are the most interesting targets for
+> post-transcriptional regulation discovery — their protein levels diverge
+> from what mRNA would predict.
+
+```{r per-gene-cor, fig.height=5}
+gene_cors <- vapply(seq_len(n_genes), function(i) {
+  cor(protein_mat[i, ], mrna_mat[i, ], method = "spearman",
+      use = "pairwise.complete.obs")
+}, numeric(1))
+names(gene_cors) <- genes
+gene_cors <- gene_cors[is.finite(gene_cors)]
+med_gene_cor <- median(gene_cors, na.rm = TRUE)
+
+ggplot(tibble(rho = gene_cors), aes(x = rho)) +
+  geom_histogram(bins = 50, fill = "grey85", colour = "grey70", linewidth = 0.2) +
+  geom_vline(xintercept = 0, colour = "black", linewidth = 1, linetype = "dotted") +
+  geom_vline(xintercept = med_gene_cor, colour = "red3",
+             linewidth = 1, linetype = "dashed") +
+  annotate("text", x = med_gene_cor, y = Inf,
+           label = sprintf("Median = %.2f", med_gene_cor),
+           vjust = 2, hjust = -0.1, colour = "red3", size = 4) +
+  labs(x = "Per-gene Spearman ρ (protein vs mRNA across samples)",
+       y = "# genes",
+       title = "Per-Gene mRNA–Protein Correlation",
+       subtitle = "Low-ρ genes are prime targets for post-transcriptional discovery") +
+  theme_report()
+```
+
+
+# Step 0: Protein Residualisation
+
+> **Aim:** Remove the transcriptional component of protein variation before
+> searching for post-transcriptional regulators. For each gene, we regress
+> protein expression on its own mRNA using ordinary least squares (OLS,
+> unpenalised). The residuals represent the portion of protein abundance that
+> **cannot** be explained by that gene's own transcription.
+>
+> **Why this matters:** In the original pipeline, mRNA_self was included as a
+> penalised LASSO feature competing with all protein predictors. The L1 penalty
+> could shrink mRNA_self to zero, meaning some targets were never corrected for
+> their own mRNA at all. By separating the mRNA correction into an explicit,
+> unpenalised OLS step, we guarantee that transcription is always accounted
+> for. Any R² from the downstream LASSO is therefore **purely**
+> post-transcriptional by construction.
+>
+> We also save the OLS intercepts and slopes per gene — these will be needed
+> to compute residuals in external validation datasets using training-set
+> statistics (preventing data leakage).
+
+```{r residualise, fig.height=5}
+residual_mat <- matrix(NA_real_, nrow = n_genes, ncol = n_samples,
+                       dimnames = list(genes, colnames(protein_mat)))
+ols_r2       <- setNames(rep(NA_real_, n_genes), genes)
+ols_slope    <- setNames(rep(NA_real_, n_genes), genes)
+ols_intercept <- setNames(rep(NA_real_, n_genes), genes)
+
+for (i in seq_len(n_genes)) {
+  p <- as.numeric(protein_mat[i, ])
+  m <- as.numeric(mrna_mat[i, ])
+  ok <- is.finite(p) & is.finite(m)
+  if (sum(ok) < 10) next
+
+  fit <- lm(p[ok] ~ m[ok])
+  residual_mat[i, which(ok)] <- residuals(fit)
+  ols_r2[i]        <- summary(fit)$r.squared
+  ols_intercept[i] <- coef(fit)[1]
+  ols_slope[i]     <- coef(fit)[2]
+}
+
+ols_df <- tibble(gene = genes, r2 = ols_r2, slope = ols_slope) %>%
+  filter(is.finite(r2))
+med_ols_r2 <- median(ols_df$r2, na.rm = TRUE)
+
+ggplot(ols_df, aes(x = r2)) +
+  geom_histogram(bins = 50, fill = "grey85", colour = "grey70", linewidth = 0.2) +
+  geom_vline(xintercept = med_ols_r2, colour = "red3",
+             linewidth = 1, linetype = "dashed") +
+  annotate("text", x = med_ols_r2, y = Inf,
+           label = sprintf("Median OLS R² = %.3f", med_ols_r2),
+           vjust = 2, hjust = -0.1, colour = "red3", size = 4) +
+  labs(x = "OLS R² (protein ~ own mRNA)", y = "# genes",
+       title = "Step 0: Variance Explained by Own mRNA",
+       subtitle = "Residuals from this OLS are the response variable for Models A, B, C") +
+  theme_report()
+
+cat(sprintf("Median OLS R²: %.3f\n", med_ols_r2))
+cat(sprintf("Genes with R² > 0.3: %d (%.1f%%)\n",
+            sum(ols_df$r2 > 0.3), mean(ols_df$r2 > 0.3) * 100))
+cat(sprintf("Genes with R² < 0.05: %d (%.1f%%) — mostly post-transcriptionally governed\n",
+            sum(ols_df$r2 < 0.05), mean(ols_df$r2 < 0.05) * 100))
+```
+
+
+# LASSO Modelling: Nested Cross-Validation {.tabset}
+
+> **Aim:** Estimate out-of-sample R² and MSE for three models, all predicting
+> **protein residuals** (from Step 0):
+>
+> - **Model A** (residuals ~ other proteins): LASSO regression using all other
+>   proteins as predictors. Identifies proteins whose abundance predicts
+>   post-transcriptional variation in the target.
+> - **Model B** (residuals ~ other mRNAs): LASSO regression using all other
+>   mRNAs as predictors. Critical control — if an mRNA predicts residuals as
+>   well as its corresponding protein, the "regulation" may be co-
+>   transcriptional leakage rather than genuine post-transcriptional biology.
+> - **Model C** (permuted baseline): Same predictors as Model A, but target
+>   residuals are shuffled. Establishes the null — any model performing no
+>   better than C is fitting noise.
+>
+> **Nested CV structure:** The outer loop (10-fold) holds out test samples
+> for unbiased performance estimation. The inner loop (5-fold, within each
+> outer training set) selects the optimal regularisation parameter λ.
+> `cv.glmnet` returns two candidates: `lambda.min` (lowest inner CV error)
+> and `lambda.1se` (most regularised model within 1 standard error of the
+> minimum). We use `lambda.1se` because it favours sparser models, reducing
+> false positive regulators at the cost of slightly higher error — the right
+> trade-off for a discovery-oriented analysis.
+
+## Parameters
+
+```{r lasso-params}
+outer_k <- 10
+inner_k <- 5
+min_n_train <- 15
+
+# High-confidence regulator thresholds
+hc_min_folds    <- 8     # selected in ≥ 8 of 10 outer folds
+hc_min_targets  <- 50    # predicts ≥ 50 target residuals
+hc_min_strength <- 0.5   # |frac_positive − frac_negative| ≥ 0.5
+```
+
+## Run Nested CV
+
+> **What happens here:** For each of the 10 outer folds, we: (1) split samples
+> into train/test, (2) build scaled predictor matrices for both proteins and
+> mRNAs using training-set statistics only, (3) for each target gene, fit
+> Models A, B, and C on the training residuals using inner 5-fold CV to select
+> lambda, (4) predict test-set residuals and compute MSE. We also record all
+> non-zero coefficients and the selected lambda for diagnostic plotting.
+
+```{r lasso-run, cache=TRUE}
+fold_id <- sample(rep(seq_len(outer_k), length.out = n_samples))
+
+mse_folds_A <- mse_folds_B <- mse_folds_C <- vector("list", outer_k)
+coef_A_list <- coef_B_list <- vector("list", outer_k)
+sel_counts_A <- sel_counts_B <- vector("list", outer_k)
+lambda_selected_A <- lambda_selected_B <- vector("list", outer_k)
+
+example_cvfit_A <- example_cvfit_B <- NULL
+example_target  <- NULL
+
+cat("Running nested CV (", outer_k, "outer ×", inner_k, "inner folds)...\n")
+
+for (f in seq_len(outer_k)) {
+  cat("  Outer fold", f, "/", outer_k, "\n")
+
+  test_idx  <- which(fold_id == f)
+  train_idx <- which(fold_id != f)
+  n_tr <- length(train_idx)
+
+  # ── Protein predictors ──
+  X_prot_tr_raw <- t(protein_mat[, train_idx, drop = FALSE])
+  X_prot_te_raw <- t(protein_mat[, test_idx,  drop = FALSE])
+  X_prot_tr_imp <- impute_with_train_means(X_prot_tr_raw, X_prot_tr_raw)
+  X_prot_te_imp <- impute_with_train_means(X_prot_te_raw, X_prot_tr_raw)
+  X_prot_tr <- scale_with_train(X_prot_tr_imp, X_prot_tr_imp)
+  X_prot_te <- scale_with_train(X_prot_te_imp, X_prot_tr_imp)
+  storage.mode(X_prot_tr) <- storage.mode(X_prot_te) <- "double"
+
+  vx <- apply(X_prot_tr, 2, var, na.rm = TRUE)
+  keep_p <- is.finite(vx) & vx > 0
+  X_prot_tr <- X_prot_tr[, keep_p, drop = FALSE]
+  X_prot_te <- X_prot_te[, keep_p, drop = FALSE]
+  prot_preds <- colnames(X_prot_tr)
+
+  # ── mRNA predictors ──
+  X_mrna_tr_raw <- t(mrna_mat[, train_idx, drop = FALSE])
+  X_mrna_te_raw <- t(mrna_mat[, test_idx,  drop = FALSE])
+  X_mrna_tr_imp <- impute_with_train_means(X_mrna_tr_raw, X_mrna_tr_raw)
+  X_mrna_te_imp <- impute_with_train_means(X_mrna_te_raw, X_mrna_tr_raw)
+  X_mrna_tr <- scale_with_train(X_mrna_tr_imp, X_mrna_tr_imp)
+  X_mrna_te <- scale_with_train(X_mrna_te_imp, X_mrna_tr_imp)
+  storage.mode(X_mrna_tr) <- storage.mode(X_mrna_te) <- "double"
+
+  vx_m <- apply(X_mrna_tr, 2, var, na.rm = TRUE)
+  keep_m <- is.finite(vx_m) & vx_m > 0
+  X_mrna_tr <- X_mrna_tr[, keep_m, drop = FALSE]
+  X_mrna_te <- X_mrna_te[, keep_m, drop = FALSE]
+  mrna_preds <- colnames(X_mrna_tr)
+
+  # ── Per-fold containers ──
+  sel_A <- setNames(integer(length(prot_preds)), prot_preds)
+  sel_B <- setNames(integer(length(mrna_preds)), mrna_preds)
+  cA <- list(); cB <- list(); kA <- 1; kB <- 1
+
+  mse_A <- mse_B <- mse_C <- setNames(rep(NA_real_, n_genes), genes)
+  lam_A_vec <- lam_B_vec <- setNames(rep(NA_real_, n_genes), genes)
+
+  for (target in genes) {
+    y_tr <- as.numeric(residual_mat[target, train_idx])
+    y_te <- as.numeric(residual_mat[target, test_idx])
+    ok_tr <- is.finite(y_tr); ok_te <- is.finite(y_te)
+    if (sum(ok_tr) < min_n_train || sum(ok_te) < 2) next
+
+    fid <- sample(rep(seq_len(inner_k), length.out = sum(ok_tr)))
+
+    # ── Model A: residuals ~ proteins ──
+    cur_p <- if (target %in% prot_preds) prot_preds[prot_preds != target] else prot_preds
+    if (length(cur_p) < 2) next
+
+    cv_A <- cv.glmnet(X_prot_tr[ok_tr, cur_p, drop = FALSE], y_tr[ok_tr],
+                      alpha = 1, nfolds = inner_k, foldid = fid,
+                      standardize = FALSE, family = "gaussian")
+    lam_A <- cv_A$lambda.1se; lam_A_vec[target] <- lam_A
+
+    if (is.null(example_cvfit_A) && target == genes[min(100, n_genes)]) {
+      example_cvfit_A <- cv_A; example_cvfit_B_placeholder <- TRUE
+      example_target <- target
+    }
+
+    yhat_A <- as.numeric(predict(cv_A, newx = X_prot_te[ok_te, cur_p, drop = FALSE], s = lam_A))
+    mse_A[target] <- mean((y_te[ok_te] - yhat_A)^2)
+
+    b_A <- as.matrix(coef(cv_A, s = lam_A))[-1, , drop = FALSE]
+    act_A <- which(b_A[, 1] != 0)
+    if (length(act_A) > 0) {
+      an <- rownames(b_A)[act_A]
+      sel_A[intersect(an, names(sel_A))] <- sel_A[intersect(an, names(sel_A))] + 1L
+      cA[[kA]] <- tibble(fold = f, target = target, regulator = an,
+                         beta = b_A[act_A, 1],
+                         sign = if_else(b_A[act_A, 1] > 0, "positive", "negative"))
+      kA <- kA + 1
+    }
+
+    # ── Model B: residuals ~ mRNAs ──
+    cur_m <- if (target %in% mrna_preds) mrna_preds[mrna_preds != target] else mrna_preds
+    if (length(cur_m) < 2) next
+
+    cv_B <- cv.glmnet(X_mrna_tr[ok_tr, cur_m, drop = FALSE], y_tr[ok_tr],
+                      alpha = 1, nfolds = inner_k, foldid = fid,
+                      standardize = FALSE, family = "gaussian")
+    lam_B <- cv_B$lambda.1se; lam_B_vec[target] <- lam_B
+
+    if (!is.null(example_cvfit_A) && is.null(example_cvfit_B) && target == example_target) {
+      example_cvfit_B <- cv_B
+    }
+
+    yhat_B <- as.numeric(predict(cv_B, newx = X_mrna_te[ok_te, cur_m, drop = FALSE], s = lam_B))
+    mse_B[target] <- mean((y_te[ok_te] - yhat_B)^2)
+
+    b_B <- as.matrix(coef(cv_B, s = lam_B))[-1, , drop = FALSE]
+    act_B <- which(b_B[, 1] != 0)
+    if (length(act_B) > 0) {
+      an_B <- rownames(b_B)[act_B]
+      sel_B[intersect(an_B, names(sel_B))] <- sel_B[intersect(an_B, names(sel_B))] + 1L
+      cB[[kB]] <- tibble(fold = f, target = target, regulator = an_B,
+                         beta = b_B[act_B, 1],
+                         sign = if_else(b_B[act_B, 1] > 0, "positive", "negative"))
+      kB <- kB + 1
+    }
+
+    # ── Model C: permuted residuals ~ proteins ──
+    y_perm <- sample(y_tr[ok_tr], replace = FALSE)
+    cv_C <- cv.glmnet(X_prot_tr[ok_tr, cur_p, drop = FALSE], y_perm,
+                      alpha = 1, nfolds = inner_k, foldid = fid,
+                      standardize = FALSE, family = "gaussian")
+    yhat_C <- as.numeric(predict(cv_C, newx = X_prot_te[ok_te, cur_p, drop = FALSE],
+                                  s = cv_C$lambda.1se))
+    mse_C[target] <- mean((y_te[ok_te] - yhat_C)^2)
+  }
+
+  mse_folds_A[[f]] <- mse_A; mse_folds_B[[f]] <- mse_B; mse_folds_C[[f]] <- mse_C
+  sel_counts_A[[f]] <- sel_A; sel_counts_B[[f]] <- sel_B
+  coef_A_list[[f]] <- bind_rows(cA); coef_B_list[[f]] <- bind_rows(cB)
+  lambda_selected_A[[f]] <- lam_A_vec; lambda_selected_B[[f]] <- lam_B_vec
+
+  cat("    Targets — A:", sum(is.finite(mse_A)),
+      " B:", sum(is.finite(mse_B)), " C:", sum(is.finite(mse_C)), "\n")
+}
+cat("Nested CV complete.\n")
+```
+
+## Aggregate Results
+
+> **What this does:** Converts the per-fold MSE lists into matrices
+> (fold × target), computes mean MSE and R² per target, and aggregates
+> non-zero coefficient counts across folds for regulator ranking.
+
+```{r aggregate}
+make_mse_mat <- function(ml) {
+  mat <- do.call(rbind, lapply(ml, as.numeric))
+  colnames(mat) <- genes; rownames(mat) <- paste0("fold", seq_along(ml)); mat
+}
+mse_mat_A <- make_mse_mat(mse_folds_A)
+mse_mat_B <- make_mse_mat(mse_folds_B)
+mse_mat_C <- make_mse_mat(mse_folds_C)
+
+mean_mse_A <- colMeans(mse_mat_A, na.rm = TRUE)
+mean_mse_B <- colMeans(mse_mat_B, na.rm = TRUE)
+mean_mse_C <- colMeans(mse_mat_C, na.rm = TRUE)
+
+resid_var <- apply(residual_mat, 1, var, na.rm = TRUE)
+r2_A <- 1 - mean_mse_A / resid_var[genes]
+r2_B <- 1 - mean_mse_B / resid_var[genes]
+r2_C <- 1 - mean_mse_C / resid_var[genes]
+
+r2_df <- bind_rows(
+  tibble(target = genes, r2 = r2_A, model = "A: residuals ~ proteins"),
+  tibble(target = genes, r2 = r2_B, model = "B: residuals ~ mRNAs"),
+  tibble(target = genes, r2 = r2_C, model = "C: permuted baseline")
+) %>% filter(is.finite(r2)) %>%
+  mutate(model = factor(model, levels = names(model_colours)))
+
+coef_A_df <- bind_rows(coef_A_list)
+coef_B_df <- bind_rows(coef_B_list)
+
+agg_sel <- function(sl) {
+  nms <- sort(unique(unlist(lapply(sl, names))))
+  mat <- matrix(0L, nrow = outer_k, ncol = length(nms),
+                dimnames = list(paste0("fold", seq_len(outer_k)), nms))
+  for (f in seq_along(sl)) { sc <- sl[[f]]; mat[f, names(sc)] <- as.integer(sc) }
+  mat
+}
+sel_mat_A <- agg_sel(sel_counts_A)
+sel_mat_B <- agg_sel(sel_counts_B)
+```
+
+
+# Lambda Diagnostics {.tabset}
+
+> **Aim:** Verify that the inner CV is selecting λ sensibly. Three diagnostic
+> plots address three questions:
+>
+> 1. **Lambda path** — Is there a clear minimum in CV error? A flat curve
+>    means the data lacks signal for this target.
+> 2. **Nonzero coefficients vs λ** — Does sparsity increase monotonically
+>    with λ? Non-monotonicity would indicate a `glmnet` pathology.
+> 3. **Lambda distribution across targets** — Is regularisation strength
+>    consistent? A bimodal distribution suggests two regimes (some targets
+>    with strong signal, others near-null).
+
+## Lambda Path (Example Target)
+
+> Shows inner CV error as a function of log(λ) for one representative target.
+> The left dashed line is `lambda.min` (lowest error); the right dashed line
+> is `lambda.1se` (our choice — most regularised within 1 SE of minimum).
+> A well-behaved curve has a clear U-shape.
+
+```{r lambda-path, fig.height=10}
+par(mfrow = c(2, 1))
+if (!is.null(example_cvfit_A))
+  plot(example_cvfit_A, main = sprintf("Model A — target: %s", example_target))
+if (!is.null(example_cvfit_B))
+  plot(example_cvfit_B, main = sprintf("Model B — target: %s", example_target))
+par(mfrow = c(1, 1))
+```
+
+## Nonzero Coefficients vs Lambda
+
+> Shows how the number of selected predictors decreases as λ increases.
+> Should be monotonically non-increasing. The vertical lines mark the two
+> candidate lambdas. The gap between `lambda.min` and `lambda.1se` tells you
+> how many features the conservative choice sacrifices for parsimony.
+
+```{r nzero-vs-lambda, fig.height=10}
+if (!is.null(example_cvfit_A)) {
+  gl_A <- example_cvfit_A$glmnet.fit
+  p1 <- ggplot(tibble(ll = log(gl_A$lambda), nz = as.numeric(gl_A$df)),
+               aes(ll, nz)) +
+    geom_line(colour = "steelblue", linewidth = 0.8) +
+    geom_vline(xintercept = log(example_cvfit_A$lambda.1se),
+               colour = "red3", linetype = "dashed") +
+    geom_vline(xintercept = log(example_cvfit_A$lambda.min),
+               colour = "orange", linetype = "dashed") +
+    annotate("text", x = log(example_cvfit_A$lambda.1se), y = Inf,
+             label = "lambda.1se", vjust = 2, hjust = -0.1, colour = "red3", size = 3) +
+    annotate("text", x = log(example_cvfit_A$lambda.min), y = Inf,
+             label = "lambda.min", vjust = 3.5, hjust = -0.1, colour = "orange", size = 3) +
+    labs(x = "log(λ)", y = "# nonzero coefficients",
+         title = sprintf("Model A — %s", example_target)) +
+    theme_report()
+
+  gl_B <- example_cvfit_B$glmnet.fit
+  p2 <- ggplot(tibble(ll = log(gl_B$lambda), nz = as.numeric(gl_B$df)),
+               aes(ll, nz)) +
+    geom_line(colour = "#4DBBD5", linewidth = 0.8) +
+    geom_vline(xintercept = log(example_cvfit_B$lambda.1se),
+               colour = "red3", linetype = "dashed") +
+    geom_vline(xintercept = log(example_cvfit_B$lambda.min),
+               colour = "orange", linetype = "dashed") +
+    labs(x = "log(λ)", y = "# nonzero coefficients",
+         title = sprintf("Model B — %s", example_target)) +
+    theme_report()
+
+  p1 / p2
+}
+```
+
+## Lambda Distribution Across Targets
+
+> Histogram of the selected `lambda.1se` across all targets (from the last
+> outer fold as representative). A unimodal distribution means the data has
+> a consistent signal strength. Bimodality would suggest two populations of
+> targets — some with strong regulatory signal (low λ) and others that are
+> essentially null (high λ, near-intercept-only model).
+
+```{r lambda-dist, fig.height=6}
+lam_df <- bind_rows(
+  tibble(ll = log(lambda_selected_A[[outer_k]]), model = "A: residuals ~ proteins"),
+  tibble(ll = log(lambda_selected_B[[outer_k]]), model = "B: residuals ~ mRNAs")
+) %>% filter(is.finite(ll))
+
+ggplot(lam_df, aes(x = ll, fill = model)) +
+  geom_histogram(bins = 50, alpha = 0.5, colour = "black",
+                 linewidth = 0.2, position = "identity") +
+  scale_fill_manual(values = model_colours[1:2]) +
+  labs(x = "log(λ.1se)", y = "# targets", fill = "Model",
+       title = "Distribution of Selected Lambda Across Targets",
+       subtitle = "Unimodal = consistent signal; bimodal = two regimes") +
+  theme_report()
+```
+
+
+# Model Performance {.tabset}
+
+> **Aim:** Compare the three models' predictive performance on protein
+> residuals. R² is the primary metric because it is scale-free and directly
+> interpretable as the proportion of post-transcriptional variance explained.
+> The key comparisons are: (1) A vs C — does the model beat random?
+> (2) A vs B — do protein predictors outperform mRNA predictors for
+> explaining residuals? If B performs nearly as well as A, the regulators
+> may reflect co-transcriptional leakage rather than genuine post-
+> transcriptional biology.
+
+## R² Summary Table
+
+```{r r2-table}
+r2_df %>%
+  group_by(model) %>%
+  summarise(n = n(), median = median(r2), mean = mean(r2),
+            pct_pos = mean(r2 > 0) * 100, pct_10 = mean(r2 > 0.1) * 100,
+            pct_30 = mean(r2 > 0.3) * 100, .groups = "drop") %>%
+  kable(digits = 3,
+        col.names = c("Model", "N", "Median R²", "Mean R²",
+                       "% > 0", "% > 0.1", "% > 0.3"),
+        caption = "R² summary (out-of-sample, 10-fold CV on protein residuals)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## R² Histograms
+
+```{r r2-hist, fig.height=6}
+ggplot(r2_df, aes(x = r2, fill = model)) +
+  geom_histogram(position = "identity", bins = 80,
+                 alpha = 0.35, colour = "black", linewidth = 0.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.5) +
+  scale_fill_manual(values = model_colours) +
+  coord_cartesian(xlim = c(-0.5, 1)) +
+  labs(x = "R² (out-of-sample)", y = "# targets", fill = "Model",
+       title = "R² Distributions — Residual Prediction",
+       subtitle = "All R² values are purely post-transcriptional (Step 0 residuals)") +
+  theme_report()
+```
+
+```{r r2-density, fig.height=5}
+ggplot(r2_df, aes(x = r2, colour = model, fill = model)) +
+  geom_density(alpha = 0.15, linewidth = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  scale_colour_manual(values = model_colours) +
+  scale_fill_manual(values = model_colours) +
+  coord_cartesian(xlim = c(-0.5, 1)) +
+  labs(x = "R²", y = "Density", colour = "Model", fill = "Model",
+       title = "R² Density Comparison") +
+  theme_report()
+```
+
+## MSE Distributions
+
+```{r mse-hist, fig.height=5}
+mse_long <- bind_rows(
+  tibble(target = genes, mse = mean_mse_A, model = "A: residuals ~ proteins"),
+  tibble(target = genes, mse = mean_mse_B, model = "B: residuals ~ mRNAs"),
+  tibble(target = genes, mse = mean_mse_C, model = "C: permuted baseline")
+) %>% filter(is.finite(mse)) %>%
+  mutate(model = factor(model, levels = names(model_colours)))
+
+cap <- as.numeric(quantile(mse_long$mse, 0.999))
+ggplot(mse_long %>% filter(mse <= cap), aes(x = mse, fill = model)) +
+  geom_histogram(position = "identity", bins = 100,
+                 alpha = 0.35, colour = "black", linewidth = 0.2) +
+  scale_fill_manual(values = model_colours) +
+  labs(x = "Mean MSE (10-fold CV)", y = "# targets", fill = "Model",
+       title = "MSE Distributions") +
+  theme_report()
+```
+
+## Model A vs B: Per-Target Scatter
+
+> **What this answers:** For each target, is it better predicted by proteins
+> (Model A) or mRNAs (Model B)? Points above the diagonal mean Model A wins.
+> The percentage of targets where A > B quantifies the overall advantage of
+> protein-level predictors for explaining post-transcriptional residuals.
+
+```{r a-vs-b, fig.height=7}
+ab_df <- tibble(target = genes, r2_A = r2_A, r2_B = r2_B) %>%
+  filter(is.finite(r2_A) & is.finite(r2_B)) %>%
+  mutate(delta = r2_A - r2_B, a_wins = delta > 0)
+
+pct_a_wins <- mean(ab_df$a_wins, na.rm = TRUE) * 100
+top_a <- ab_df %>% slice_max(delta, n = 10, with_ties = FALSE)
+
+ggplot(ab_df, aes(x = r2_B, y = r2_A)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_point(aes(colour = a_wins), alpha = 0.4, size = 1) +
+  geom_text_repel(data = top_a, aes(label = target),
+                  size = 2.8, max.overlaps = 15, colour = "red3") +
+  scale_colour_manual(values = c("TRUE" = "steelblue", "FALSE" = "grey70"),
+                      labels = c("TRUE" = "A > B", "FALSE" = "B ≥ A")) +
+  coord_cartesian(xlim = c(-0.5, 1), ylim = c(-0.5, 1)) +
+  labs(x = "R² — Model B (residuals ~ mRNAs)",
+       y = "R² — Model A (residuals ~ proteins)",
+       colour = "Better model",
+       title = "Per-Target R²: Model A vs B",
+       subtitle = sprintf("%.1f%% of targets better predicted by proteins", pct_a_wins)) +
+  theme_report()
+```
+
+## Variance Decomposition
+
+> **What this answers:** Across all targets, what fraction show strong protein
+> signal, moderate improvement, mRNA-dominant signal (co-transcriptional
+> leakage), or no signal at all? This is a high-level summary of where
+> post-transcriptional regulation matters.
+
+```{r decomp, fig.height=4}
+decomp <- ab_df %>%
+  mutate(cat = case_when(
+    r2_A > 0.3 & delta > 0.05 ~ "Strong protein signal (R²>0.3, Δ>0.05)",
+    r2_A > 0.1 & delta > 0    ~ "Moderate protein improvement",
+    r2_B > r2_A               ~ "mRNA better (co-transcriptional?)",
+    TRUE                       ~ "Weak / no signal"
+  )) %>% dplyr::count(cat, name = "n") %>% mutate(pct = n / sum(n) * 100)
+
+ggplot(decomp, aes(x = reorder(cat, n), y = n, fill = cat)) +
+  geom_col(width = 0.7, alpha = 0.85) +
+  geom_text(aes(label = sprintf("%d (%.1f%%)", n, pct)), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  labs(x = NULL, y = "# targets", title = "Variance Decomposition") +
+  theme_report() + theme(legend.position = "none") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.3)))
+```
+
+
+# Elastic Net Sensitivity {.tabset}
+
+> **Aim:** Test whether the top LASSO regulators are robust to the penalty
+> choice. LASSO (α=1) arbitrarily picks one of several correlated predictors
+> and zeros out the rest. Elastic net (α=0.5) mixes L1 and L2 penalties,
+> retaining correlated predictors together. If the same proteins emerge under
+> both penalties, confidence is high. If they diverge, the LASSO regulators
+> may be arbitrary selections among correlated candidates (e.g., proteins in
+> the same complex).
+
+```{r elastic-net, cache=TRUE}
+cat("Running elastic net sensitivity (α = 0.5) on Model A...\n")
+enet_sel_counts <- vector("list", outer_k)
+
+for (f in seq_len(outer_k)) {
+  cat("  Fold", f, "\n")
+  train_idx <- which(fold_id != f)
+
+  X_tr_raw <- t(protein_mat[, train_idx, drop = FALSE])
+  X_tr_imp <- impute_with_train_means(X_tr_raw, X_tr_raw)
+  X_tr_sc  <- scale_with_train(X_tr_imp, X_tr_imp)
+  storage.mode(X_tr_sc) <- "double"
+  vx <- apply(X_tr_sc, 2, var, na.rm = TRUE)
+  keep <- is.finite(vx) & vx > 0
+  X_tr_sc <- X_tr_sc[, keep, drop = FALSE]
+  pnames <- colnames(X_tr_sc)
+  sel_en <- setNames(integer(length(pnames)), pnames)
+
+  for (target in genes) {
+    y_tr <- as.numeric(residual_mat[target, train_idx])
+    ok <- is.finite(y_tr); if (sum(ok) < min_n_train) next
+    cur <- if (target %in% pnames) pnames[pnames != target] else pnames
+    if (length(cur) < 2) next
+
+    cv_en <- cv.glmnet(X_tr_sc[ok, cur, drop = FALSE], y_tr[ok], alpha = 0.5,
+                       nfolds = inner_k,
+                       foldid = sample(rep(seq_len(inner_k), length.out = sum(ok))),
+                       standardize = FALSE, family = "gaussian")
+    b <- as.matrix(coef(cv_en, s = cv_en$lambda.1se))[-1, , drop = FALSE]
+    active <- intersect(rownames(b)[b[, 1] != 0], names(sel_en))
+    if (length(active) > 0) sel_en[active] <- sel_en[active] + 1L
+  }
+  enet_sel_counts[[f]] <- sel_en
+}
+
+enet_mat <- agg_sel(enet_sel_counts)
+enet_total <- colSums(enet_mat)
+cat("Elastic net complete.\n")
+```
+
+## LASSO vs Elastic Net Comparison
+
+> **What this shows:** Scatter plot of per-regulator selection frequency
+> under LASSO vs elastic net. High Spearman ρ = regulators are robust.
+> Points far off the diagonal are penalty-sensitive — interpret with caution.
+
+```{r lasso-vs-enet, fig.height=7}
+lasso_total_A <- colSums(sel_mat_A)
+
+compare_regs <- full_join(
+  tibble(protein = names(lasso_total_A), lasso = as.integer(lasso_total_A)),
+  tibble(protein = names(enet_total),    enet  = as.integer(enet_total)),
+  by = "protein"
+) %>% mutate(lasso = replace_na(lasso, 0), enet = replace_na(enet, 0))
+
+cor_val <- cor(compare_regs$lasso, compare_regs$enet,
+               method = "spearman", use = "complete.obs")
+
+top30 <- compare_regs %>%
+  filter(lasso >= sort(lasso, decreasing = TRUE)[min(30, nrow(compare_regs))] |
+         enet  >= sort(enet,  decreasing = TRUE)[min(30, nrow(compare_regs))])
+
+ggplot(compare_regs, aes(lasso, enet)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_point(alpha = 0.3, size = 1, colour = "grey60") +
+  geom_point(data = top30, colour = "steelblue", size = 2, alpha = 0.7) +
+  geom_text_repel(data = top30 %>% slice_max(lasso, n = 15),
+                  aes(label = protein), size = 2.5, max.overlaps = 20) +
+  labs(x = "# targets (LASSO α=1)", y = "# targets (Elastic Net α=0.5)",
+       title = "LASSO vs Elastic Net: Regulator Robustness",
+       subtitle = sprintf("Spearman ρ = %.3f", cor_val)) +
+  theme_report()
+```
+
+
+# Regulator Analysis {.tabset}
+
+> **Aim:** Characterise the protein regulators identified by Model A. A
+> "regulator" is a protein selected by the LASSO as a non-zero predictor
+> of another protein's residual. We aggregate selection counts across folds,
+> compute directionality (positive vs negative), and apply high-confidence
+> filters to identify the most robust candidates.
+
+## High-Confidence Regulators
+
+> **Filtering criteria:** A high-confidence (HC) regulator must be:
+> (1) selected in ≥ 8 of 10 outer folds (reproducible across data splits),
+> (2) selected for ≥ 50 distinct targets (broad influence),
+> (3) directionally stable (|frac_pos − frac_neg| ≥ 0.5, consistent sign).
+
+```{r hc-regs-A}
+dir_A <- coef_A_df %>%
+  mutate(sn = sign(beta)) %>%
+  group_by(regulator) %>%
+  summarise(n = n(), fp = mean(sn > 0), fn = mean(sn < 0),
+            dom = if_else(fp >= fn, "positive", "negative"),
+            str = abs(fp - fn), .groups = "drop")
+
+lasso_folds_A <- colSums(sel_mat_A > 0)
+
+reg_tbl_A <- tibble(protein = names(lasso_total_A),
+                    total = as.integer(lasso_total_A),
+                    folds = as.integer(lasso_folds_A)) %>%
+  left_join(dir_A, by = c("protein" = "regulator")) %>%
+  mutate(across(c(fp, fn, str), ~ replace_na(.x, 0)))
+
+hc_A <- reg_tbl_A %>%
+  filter(folds >= hc_min_folds, total >= hc_min_targets, str >= hc_min_strength) %>%
+  arrange(desc(total))
+
+cat(sprintf("HC regulators (Model A): %d (%d pos, %d neg)\n",
+            nrow(hc_A), sum(hc_A$dom == "positive"), sum(hc_A$dom == "negative")))
+```
+
+```{r hc-top15, fig.height=7}
+top_hc <- hc_A %>%
+  group_by(dom) %>% slice_max(total, n = 15, with_ties = FALSE) %>% ungroup()
+
+ggplot(top_hc, aes(x = reorder(protein, total), y = total, fill = dom)) +
+  geom_col(width = 0.8) + coord_flip() +
+  facet_wrap(~ dom, scales = "free_y") +
+  scale_fill_manual(values = sign_colours) +
+  labs(x = "Regulator", y = "# targets selected",
+       title = "Top 15 HC Regulators (Model A)") +
+  theme_report() + theme(legend.position = "none", strip.background = element_blank())
+```
+
+## Directionality Scatter
+
+> **What this shows:** Each dot is a regulator protein. X = breadth (how many
+> targets it predicts), Y = directionality (how consistently positive or
+> negative). The green box marks the HC region. Regulators inside this box
+> are reproducible, broad, and directionally consistent.
+
+```{r dir-scatter, fig.height=6}
+ggplot(reg_tbl_A %>% filter(dom %in% c("positive", "negative")) %>%
+         mutate(pass = folds >= hc_min_folds),
+       aes(total, str)) +
+  annotate("rect", xmin = hc_min_targets, xmax = Inf,
+           ymin = hc_min_strength, ymax = Inf,
+           fill = "darkseagreen2", alpha = 0.2) +
+  geom_point(aes(colour = dom, alpha = pass), size = 0.8) +
+  scale_alpha_manual(values = c(`TRUE` = 0.7, `FALSE` = 0.1), guide = "none") +
+  geom_vline(xintercept = hc_min_targets, linetype = "dashed") +
+  geom_hline(yintercept = hc_min_strength, linetype = "dashed") +
+  scale_colour_manual(values = sign_colours) +
+  labs(x = "# targets selected", y = "|pos − neg|", colour = "Dominant sign",
+       title = "Directionality vs Breadth — Model A") +
+  theme_report()
+```
+
+## Network Breadth
+
+> **What this shows:** How many targets each regulator predicts (left) and
+> how many regulators each target has (right). Hub regulators with very high
+> breadth are candidate master regulators.
+
+```{r breadth, fig.height=8}
+p1 <- coef_A_df %>% distinct(regulator, target) %>% dplyr::count(regulator, name = "n") %>%
+  ggplot(aes(n)) + geom_histogram(bins = 50, fill = "darkcyan", colour = "black",
+                                   alpha = 0.6, linewidth = 0.2) +
+  labs(x = "# targets per regulator", y = "# regulators", title = "Regulator Breadth") +
+  theme_report()
+
+p2 <- coef_A_df %>% distinct(target, regulator) %>% dplyr::count(target, name = "n") %>%
+  ggplot(aes(n)) + geom_histogram(bins = 50, fill = "darkcyan", colour = "black",
+                                   alpha = 0.6, linewidth = 0.2) +
+  labs(x = "# regulators per target", y = "# targets", title = "Target Complexity") +
+  theme_report()
+
+p1 / p2
+```
+
+## Regulators Ranked by R²
+
+> **What this answers:** Which HC regulators are associated with the
+> best-predicted targets? A regulator whose targets have high R² is both
+> reproducibly selected and contributes to well-predicted outcomes.
+
+```{r reg-r2, fig.height=7}
+r2_tgt <- tibble(target = genes, r2 = r2_A) %>% filter(is.finite(r2))
+
+reg_r2 <- coef_A_df %>%
+  filter(regulator %in% hc_A$protein) %>%
+  distinct(regulator, target) %>%
+  left_join(r2_tgt, by = "target") %>% filter(is.finite(r2)) %>%
+  group_by(regulator) %>%
+  summarise(n = n(), med_r2 = median(r2), .groups = "drop") %>%
+  left_join(hc_A %>% dplyr::select(protein, dom), by = c("regulator" = "protein")) %>%
+  slice_max(med_r2, n = 20, with_ties = FALSE)
+
+ggplot(reg_r2, aes(reorder(regulator, med_r2), med_r2, fill = dom)) +
+  geom_col(width = 0.7, alpha = 0.85) + coord_flip() +
+  scale_fill_manual(values = sign_colours) +
+  labs(x = "Regulator", y = "Median R² of targets", fill = "Sign",
+       title = "Top 20 HC Regulators by Median Target R²") +
+  theme_report()
+```
+
+
+# Model A vs B: Regulator Overlap {.tabset}
+
+> **Aim:** This is the critical test for co-transcriptional leakage. We
+> identify HC regulators in Model B (mRNAs), then classify all HC regulators
+> into three categories:
+>
+> - **Model A only:** Protein predicts residuals but the corresponding mRNA
+>   does not → **genuine post-transcriptional regulator**
+> - **Both A and B:** Both protein and mRNA predict residuals → **suspicious,
+>   likely co-transcriptional leakage** (the signal survived OLS correction)
+> - **Model B only:** mRNA predicts but protein does not → **transcriptional
+>   residual** not fully removed by Step 0
+>
+> The "A only" set represents the highest-confidence post-transcriptional
+> candidates and should be the focus of biological follow-up.
+
+## HC Regulators in Model B
+
+```{r hc-B}
+lasso_total_B <- colSums(sel_mat_B)
+lasso_folds_B <- colSums(sel_mat_B > 0)
+
+dir_B <- coef_B_df %>%
+  mutate(sn = sign(beta)) %>%
+  group_by(regulator) %>%
+  summarise(n = n(), fp = mean(sn > 0), fn = mean(sn < 0),
+            dom = if_else(fp >= fn, "positive", "negative"),
+            str = abs(fp - fn), .groups = "drop")
+
+reg_tbl_B <- tibble(protein = names(lasso_total_B),
+                    total = as.integer(lasso_total_B),
+                    folds = as.integer(lasso_folds_B)) %>%
+  left_join(dir_B, by = c("protein" = "regulator")) %>%
+  mutate(across(c(fp, fn, str), ~ replace_na(.x, 0)))
+
+hc_B <- reg_tbl_B %>%
+  filter(folds >= hc_min_folds, total >= hc_min_targets, str >= hc_min_strength) %>%
+  arrange(desc(total))
+
+cat(sprintf("HC regulators (Model B — mRNA): %d\n", nrow(hc_B)))
+```
+
+## Overlap Classification
+
+```{r overlap}
+set_A <- hc_A$protein; set_B <- hc_B$protein
+in_both <- intersect(set_A, set_B)
+only_A  <- setdiff(set_A, set_B)
+only_B  <- setdiff(set_B, set_A)
+
+tribble(
+  ~Category,                            ~Count,        ~Interpretation,
+  "Model A only (protein, not mRNA)",   length(only_A), "Genuine post-transcriptional",
+  "Both A and B",                       length(in_both),"Co-transcriptional leakage?",
+  "Model B only (mRNA, not protein)",   length(only_B), "Transcriptional residual"
+) %>%
+  kable(caption = "Overlap of HC regulators between Models A and B") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r overlap-bar, fig.height=5}
+bind_rows(
+  tibble(gene = only_A, cat = "A only\n(post-transcriptional)"),
+  tibble(gene = in_both, cat = "Both A & B\n(leakage?)"),
+  tibble(gene = only_B, cat = "B only\n(transcriptional)")
+) %>% dplyr::count(cat, name = "n") %>%
+  mutate(cat = factor(cat, levels = c("A only\n(post-transcriptional)",
+                                       "Both A & B\n(leakage?)",
+                                       "B only\n(transcriptional)"))) %>%
+  ggplot(aes(cat, n, fill = cat)) +
+  geom_col(width = 0.6, alpha = 0.85, colour = "black", linewidth = 0.2) +
+  geom_text(aes(label = n), vjust = -0.5, size = 4.5) +
+  scale_fill_manual(values = c("#E64B35", "#91D1C2", "#4DBBD5")) +
+  labs(x = NULL, y = "# HC regulators",
+       title = "Model A vs B Overlap: The Co-Transcriptional Leakage Test",
+       subtitle = "'A only' = highest-confidence post-transcriptional candidates") +
+  theme_report() + theme(legend.position = "none") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)))
+```
+
+## Leakage Candidates (Both A & B)
+
+> **What to do with these:** These genes' protein AND mRNA levels both predict
+> targets' residuals. Check whether they are known co-transcriptionally
+> regulated clusters (e.g., mitochondrial biogenesis genes under PGC-1α). If
+> the sign is the same in both models, co-transcriptional leakage is very
+> likely. If signs differ, the protein may have genuine post-transcriptional
+> activity in addition to its transcriptional co-regulation.
+
+```{r leakage-table}
+if (length(in_both) > 0) {
+  hc_A %>%
+    filter(protein %in% in_both) %>%
+    dplyr::select(protein, total_A = total, sign_A = dom) %>%
+    left_join(hc_B %>% dplyr::select(protein, total_B = total, sign_B = dom),
+              by = "protein") %>%
+    mutate(same_sign = sign_A == sign_B) %>% arrange(desc(total_A)) %>%
+    kable(caption = "Genes in both Model A and B HC lists") %>%
+    kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+} else {
+  cat("✓ No overlap — all Model A HC regulators are unique to the protein level.\n")
+}
+```
+
+## Highest-Confidence Post-Transcriptional Regulators (A only)
+
+> **These are the final output.** These proteins pass all statistical filters
+> AND cannot be recapitulated at the mRNA level, making them the strongest
+> candidates for genuine post-transcriptional regulation.
+
+```{r a-only-table}
+hc_A %>%
+  filter(protein %in% only_A) %>%
+  dplyr::select(protein, total, folds, dom, str) %>%
+  kable(col.names = c("Protein", "# targets", "# folds", "Sign", "Directionality"),
+        digits = 3,
+        caption = "Highest-confidence post-transcriptional regulators (A only)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+
+# External Validation {.tabset}
+
+> **Aim:** Models trained on Satpathy LSCC tumour are evaluated on independent
+> datasets from different studies, tissues, and conditions. Generalisation to
+> external data is the gold standard for model validity — a model that performs
+> well only on training data is overfit. Here we:
+>
+> 1. Retrain Model A on **all** Satpathy samples (no hold-out) to get final
+>    per-target models.
+> 2. Apply training-set OLS coefficients (Step 0) to compute residuals in each
+>    external dataset — this prevents data leakage.
+> 3. Predict external residuals using the final Model A and compute R²/MSE.
+> 4. Repeat with Model C (permuted) as a null baseline.
+
+## Retrain Final Models on Full Satpathy
+
+> **What this does:** The CV loop used partial training sets (9/10 folds).
+> For external validation, we retrain on all Satpathy samples to get the
+> best possible models. The OLS intercepts, slopes, and protein scaling
+> statistics are saved as a bundle for applying to external data.
+
+```{r final-train, cache=TRUE}
+cat("Retraining final models on all Satpathy samples...\n")
+
+# ── Full protein predictor matrix ──
+X_full_raw <- t(protein_mat)  # samples × genes
+X_full_imp <- impute_with_train_means(X_full_raw, X_full_raw)
+X_full_sc  <- scale_with_train(X_full_imp, X_full_imp)
+storage.mode(X_full_sc) <- "double"
+
+vx_full <- apply(X_full_sc, 2, var, na.rm = TRUE)
+keep_full <- is.finite(vx_full) & vx_full > 0
+X_full_sc <- X_full_sc[, keep_full, drop = FALSE]
+final_pred_names <- colnames(X_full_sc)
+
+# Save scaling stats for external application
+prot_mu_full <- colMeans(X_full_imp, na.rm = TRUE)
+prot_sd_full <- apply(X_full_imp, 2, sd, na.rm = TRUE)
+prot_sd_full[!is.finite(prot_sd_full) | prot_sd_full == 0] <- 1
+
+# ── Fit final LASSO per target ──
+final_models_A <- vector("list", n_genes); names(final_models_A) <- genes
+final_models_C <- vector("list", n_genes); names(final_models_C) <- genes
+final_lambda_A <- setNames(rep(NA_real_, n_genes), genes)
+final_lambda_C <- setNames(rep(NA_real_, n_genes), genes)
+final_feat_A   <- vector("list", n_genes); names(final_feat_A) <- genes
+
+n_fit <- 0L
+for (ii in seq_along(genes)) {
+  target <- genes[ii]
+  if (ii %% 500 == 0) cat("  Progress:", ii, "/", n_genes, "\n")
+
+  y_tr <- as.numeric(residual_mat[target, ])
+  ok <- is.finite(y_tr); if (sum(ok) < min_n_train) next
+
+  cur <- if (target %in% final_pred_names) {
+    final_pred_names[final_pred_names != target]
+  } else final_pred_names
+  if (length(cur) < 2) next
+
+  Xtr <- X_full_sc[ok, cur, drop = FALSE]
+  fid <- sample(rep(seq_len(inner_k), length.out = sum(ok)))
+
+  cv_A <- cv.glmnet(Xtr, y_tr[ok], alpha = 1, nfolds = inner_k, foldid = fid,
+                    standardize = FALSE, family = "gaussian")
+  final_models_A[[target]] <- cv_A
+  final_lambda_A[target]   <- cv_A$lambda.1se
+  final_feat_A[[target]]   <- cur
+
+  y_perm <- sample(y_tr[ok], replace = FALSE)
+  cv_C <- cv.glmnet(Xtr, y_perm, alpha = 1, nfolds = inner_k, foldid = fid,
+                    standardize = FALSE, family = "gaussian")
+  final_models_C[[target]] <- cv_C
+  final_lambda_C[target]   <- cv_C$lambda.1se
+
+  n_fit <- n_fit + 1L
+}
+cat("Final models trained:", n_fit, "targets\n")
+```
+
+## Evaluate on External Datasets
+
+> **What this does:** For each external dataset, we: (1) align genes/samples
+> with the training set, (2) compute protein residuals using **training-set**
+> OLS coefficients (no data leakage), (3) build a scaled protein predictor
+> matrix using training-set means/SDs, (4) predict residuals using the final
+> Model A and C, and (5) compute MSE and R² per target.
+
+```{r external-eval, cache=TRUE}
+# Helper: build scaled predictor matrix for external data
+make_X_ext <- function(prot_test, pred_names, mu, sdv) {
+  X_raw <- t(prot_test)
+  genes_present <- colnames(X_raw)
+  mu_p <- mu[genes_present]; mu_p[!is.finite(mu_p)] <- 0
+  sd_p <- sdv[genes_present]; sd_p[!is.finite(sd_p) | sd_p == 0] <- 1
+
+  for (j in seq_len(ncol(X_raw))) {
+    nas <- is.na(X_raw[, j]) | !is.finite(X_raw[, j])
+    if (any(nas)) X_raw[nas, j] <- mu_p[j]
+  }
+  X_sc <- sweep(sweep(X_raw, 2, mu_p, "-"), 2, sd_p, "/")
+  storage.mode(X_sc) <- "double"
+
+  X_full <- matrix(0, nrow = nrow(X_sc), ncol = length(pred_names),
+                   dimnames = list(rownames(X_sc), pred_names))
+  common <- intersect(pred_names, colnames(X_sc))
+  if (length(common) > 0) X_full[, common] <- X_sc[, common, drop = FALSE]
+  storage.mode(X_full) <- "double"
+  X_full
+}
+
+ext_results <- list()
+ext_qc_rows <- list()
+
+for (i in seq_len(nrow(ext_test_sets))) {
+  ds   <- ext_test_sets$dataset[i]
+  cat("\n--- Evaluating:", ds, "---\n")
+
+  if (!file.exists(ext_test_sets$protein_path[i]) ||
+      !file.exists(ext_test_sets$mrna_path[i])) {
+    cat("  Files not found, skipping.\n")
+    ext_qc_rows[[i]] <- tibble(dataset = ds, n_samples = NA, n_genes = 0, n_eval = 0)
+    next
+  }
+
+#  prot_ext <- readRDS(ext_test_sets$protein_path[i])
+ # mrna_ext <- readRDS(ext_test_sets$mrna_path[i])
+  
+  
+  prot_ext_raw <- read_csv(ext_test_sets$protein_path[i], show_col_types = FALSE)
+  prot_ext <- prot_ext_raw %>% dplyr::select(where(is.numeric)) %>% as.matrix()
+  rownames(prot_ext) <- prot_ext_raw$symbol
+
+  mrna_ext_raw <- read_csv(ext_test_sets$mrna_path[i], show_col_types = FALSE)
+  mrna_ext <- mrna_ext_raw %>% dplyr::select(where(is.numeric)) %>% as.matrix()
+  rownames(mrna_ext) <- mrna_ext_raw$symbol
+
+  # Align samples
+  cs <- intersect(colnames(prot_ext), colnames(mrna_ext))
+  if (length(cs) == 0) { cat("  No common samples.\n"); next }
+  prot_ext <- prot_ext[, cs, drop = FALSE]
+  mrna_ext <- mrna_ext[, cs, drop = FALSE]
+
+  # Align genes with training
+  cg <- intersect(genes, intersect(rownames(prot_ext), rownames(mrna_ext)))
+  if (length(cg) == 0) { cat("  No common genes.\n"); next }
+  prot_ext <- prot_ext[cg, , drop = FALSE]
+  mrna_ext <- mrna_ext[cg, , drop = FALSE]
+  cat("  Samples:", ncol(prot_ext), " Genes:", length(cg), "\n")
+
+  # ── Compute residuals using TRAINING-set OLS coefficients ──
+  resid_ext <- matrix(NA_real_, nrow = length(cg), ncol = ncol(prot_ext),
+                      dimnames = list(cg, colnames(prot_ext)))
+  for (g in cg) {
+    if (!is.finite(ols_slope[g]) || !is.finite(ols_intercept[g])) next
+    p <- as.numeric(prot_ext[g, ])
+    m <- as.numeric(mrna_ext[g, ])
+    ok <- is.finite(p) & is.finite(m)
+    resid_ext[g, which(ok)] <- p[ok] - (ols_intercept[g] + ols_slope[g] * m[ok])
+  }
+
+  # ── Build scaled protein predictor matrix ──
+  X_ext <- make_X_ext(prot_ext, final_pred_names, prot_mu_full, prot_sd_full)
+
+  # ── Predictor coverage QC ──
+  # For each target with a trained model, check what fraction of its
+  # non-zero LASSO coefficients correspond to proteins present in
+  # this validation dataset.
+  ext_proteins_available <- rownames(prot_ext)
+
+  coverage_per_target <- vapply(cg, function(target) {
+    if (is.null(final_models_A[[target]])) return(NA_real_)
+    if (!is.finite(final_lambda_A[target])) return(NA_real_)
+
+    b <- as.matrix(coef(final_models_A[[target]], s = final_lambda_A[target]))[-1, , drop = FALSE]
+    active <- rownames(b)[b[, 1] != 0]
+    if (length(active) == 0) return(NA_real_)
+
+    mean(active %in% ext_proteins_available) * 100
+  }, numeric(1))
+
+  coverage_per_target <- coverage_per_target[is.finite(coverage_per_target)]
+
+  cat(sprintf("  Predictor coverage: median = %.1f%%, mean = %.1f%%, min = %.1f%%\n",
+              median(coverage_per_target),
+              mean(coverage_per_target),
+              min(coverage_per_target)))
+
+  # ── Add to QC row ──
+  # Replace your existing ext_qc_rows[[i]] line with this:
+  ext_qc_rows[[i]] <- tibble(
+    dataset    = ds,
+    n_samples  = ncol(prot_ext),
+    n_genes    = length(cg),
+    n_eval     = n_eval,
+    med_coverage_pct = median(coverage_per_target),
+    mean_coverage_pct = mean(coverage_per_target),
+    min_coverage_pct  = min(coverage_per_target)
+  )
+  
+  
+  # ── Predict per target ──
+  mse_ext_A <- mse_ext_C <- setNames(rep(NA_real_, length(cg)), cg)
+
+  for (target in cg) {
+    if (is.null(final_models_A[[target]])) next
+    if (!is.finite(final_lambda_A[target])) next
+    feat <- final_feat_A[[target]]; if (is.null(feat)) next
+
+    y_te <- as.numeric(resid_ext[target, ])
+    ok_te <- is.finite(y_te); if (sum(ok_te) < 2) next
+
+    Xte <- X_ext[ok_te, feat, drop = FALSE]
+
+    yhat_A <- as.numeric(predict(final_models_A[[target]], newx = Xte,
+                                  s = final_lambda_A[target]))
+    mse_ext_A[target] <- mean((y_te[ok_te] - yhat_A)^2)
+
+    yhat_C <- as.numeric(predict(final_models_C[[target]], newx = Xte,
+                                  s = final_lambda_C[target]))
+    mse_ext_C[target] <- mean((y_te[ok_te] - yhat_C)^2)
+  }
+
+  n_eval <- sum(is.finite(mse_ext_A))
+  cat("  Evaluated targets:", n_eval, "\n")
+
+  ext_results[[ds]] <- tibble(
+    target = names(mse_ext_A), mse_real = mse_ext_A, mse_rand = mse_ext_C,
+    dataset = ds
+  ) %>% filter(is.finite(mse_real) & is.finite(mse_rand))
+
+  ext_qc_rows[[i]] <- tibble(dataset = ds, n_samples = ncol(prot_ext),
+                              n_genes = length(cg), n_eval = n_eval)
+}
+
+ext_mse_long <- bind_rows(ext_results)
+ext_qc_tbl   <- bind_rows(ext_qc_rows)
+has_ext <- nrow(ext_mse_long) > 0
+```
+
+## External QC Table
+
+> **What this shows:** How many samples and genes overlap between each
+> external dataset and the Satpathy training set. Low overlap reduces power
+> but does not invalidate the test.
+
+```{r ext-qc, eval=has_ext}
+ext_qc_tbl %>%
+  kable(col.names = c("Dataset", "Samples", "Overlapping genes", "Evaluated targets",
+              "Median coverage %", "Mean coverage %", "Min coverage %")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+
+```
+
+## External R² Distributions
+
+> **What this answers:** Does the model generalise? R² is computed using
+> training-set residual variance as denominator, making it comparable across
+> datasets. Positive external R² = the model captures genuine biology.
+> Consistent with training CV = not overfit. Large leftward shift = overfit.
+
+```{r ext-r2, eval=has_ext, fig.height=8}
+ext_r2 <- ext_mse_long %>%
+  mutate(var_tr = resid_var[target],
+         r2_real = 1 - mse_real / var_tr,
+         r2_rand = 1 - mse_rand / var_tr) %>%
+  filter(is.finite(r2_real) & is.finite(r2_rand))
+
+ext_r2_long <- ext_r2 %>%
+  pivot_longer(c(r2_real, r2_rand), names_to = "model", values_to = "r2") %>%
+  mutate(model = recode(model, r2_real = "Real (A)", r2_rand = "Random (C)"))
+
+ext_r2_long %>%
+  group_by(dataset) %>%
+  group_map(function(df, key) {
+    ggplot(df, aes(r2, fill = model)) +
+      geom_histogram(position = "identity", bins = 60,
+                     alpha = 0.4, colour = "black", linewidth = 0.15) +
+      geom_vline(xintercept = 0, linetype = "dashed") +
+      coord_cartesian(xlim = c(-1, 1)) +
+      labs(x = "R²", y = "# targets", title = key$dataset, fill = NULL) +
+      theme_report(10) + theme(legend.position = "bottom")
+  }, .keep = TRUE) %>%
+  wrap_plots(ncol = 2) +
+  plot_annotation(title = "External Validation: R² Distributions",
+                  subtitle = "Real model should shift right of random baseline")
+```
+
+## External R² Summary
+
+```{r ext-r2-summary, eval=has_ext}
+ext_r2 %>%
+  group_by(dataset) %>%
+  summarise(n = n(), med_r2 = median(r2_real), mean_r2 = mean(r2_real),
+            pct_pos = mean(r2_real > 0) * 100,
+            med_r2_rand = median(r2_rand), .groups = "drop") %>%
+  kable(digits = 3,
+        col.names = c("Dataset", "N", "Median R²", "Mean R²", "% > 0",
+                       "Median R² (random)"),
+        caption = "External validation R² summary") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## Combined R²: Training CV + External
+
+> **What this answers:** Are the training and external R² distributions
+> consistent? Overlay allows direct visual comparison. A large leftward
+> shift in external R² relative to training CV indicates overfitting.
+
+```{r combined-r2, eval=has_ext, fig.height=5}
+r2_combined <- bind_rows(
+  r2_df %>% filter(model == "A: residuals ~ proteins") %>%
+    mutate(source = "Training CV (10-fold)") %>% dplyr::select(target, r2, source),
+  ext_r2 %>% mutate(source = paste0("Ext: ", dataset)) %>%
+    dplyr::select(target, r2 = r2_real, source)
+)
+
+ggplot(r2_combined, aes(r2, fill = source)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 position = "identity", bins = 60,
+                 alpha = 0.25, colour = "black", linewidth = 0.15) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  coord_cartesian(xlim = c(-1, 1)) +
+  labs(x = "R²", y = "Density", fill = "Source",
+       title = "R² Comparison: Training CV vs External Validation",
+       subtitle = "Consistent distributions = model generalises well") +
+  theme_report() + theme(legend.position = "bottom")
+```
+
+
+# GO Enrichment {.tabset}
+
+> **Aim:** Test whether HC regulators enrich for expected biological processes.
+> This provides face validity:
+>
+> - **Positive regulators** should enrich for translation, ribosome biogenesis,
+>   mRNA processing — processes that increase protein production.
+> - **Negative regulators** should enrich for protein degradation, ubiquitin-
+>   proteasome, autophagy, stress response — processes that decrease protein.
+> - **"A only"** regulators should show the cleanest enrichment for genuinely
+>   post-transcriptional terms, with minimal leakage of transcriptional
+>   processes like mitochondrial biogenesis.
+
+```{r go-helper}
+run_topgo <- function(fg, bg, ontology = "BP", n_top = 20) {
+  glist <- factor(as.integer(bg %in% fg)); names(glist) <- bg
+  GOdata <- new("topGOdata", ontology = ontology, allGenes = glist,
+                geneSel = function(x) x == 1, nodeSize = 10,
+                annot = annFUN.org, mapping = "org.Hs.eg.db", ID = "symbol")
+  result <- runTest(GOdata, algorithm = "weight01", statistic = "fisher")
+  GenTable(GOdata, Fisher = result, orderBy = "Fisher",
+           ranksOf = "Fisher", topNodes = n_top)
+}
+bg_genes <- rownames(protein_mat)
+```
+
+## Positive HC Regulators
+
+```{r go-pos, fig.height=6}
+fg_pos <- hc_A %>% filter(dom == "positive") %>% pull(protein)
+go_pos <- run_topgo(fg_pos, bg_genes)
+
+go_pos %>% kable(caption = "GO BP — Positive HC regulators") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE, font_size = 11)
+
+go_pos %>%
+  mutate(Fisher = as.numeric(gsub("< ", "", Fisher)), nlp = -log10(Fisher)) %>%
+  slice_max(nlp, n = 15) %>%
+  ggplot(aes(nlp, reorder(Term, nlp))) +
+  geom_col(fill = "firebrick", alpha = 0.7, width = 0.7) +
+  labs(x = expression(-log[10](p)), y = NULL,
+       title = "GO: Positive HC Regulators",
+       subtitle = "Expected: translation, ribosome biogenesis") +
+  theme_report()
+```
+
+## Negative HC Regulators
+
+```{r go-neg, fig.height=6}
+fg_neg <- hc_A %>% filter(dom == "negative") %>% pull(protein)
+go_neg <- run_topgo(fg_neg, bg_genes)
+
+go_neg %>% kable(caption = "GO BP — Negative HC regulators") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE, font_size = 11)
+
+go_neg %>%
+  mutate(Fisher = as.numeric(gsub("< ", "", Fisher)), nlp = -log10(Fisher)) %>%
+  slice_max(nlp, n = 15) %>%
+  ggplot(aes(nlp, reorder(Term, nlp))) +
+  geom_col(fill = "deepskyblue", alpha = 0.7, width = 0.7) +
+  labs(x = expression(-log[10](p)), y = NULL,
+       title = "GO: Negative HC Regulators",
+       subtitle = "Expected: degradation, ubiquitin, stress") +
+  theme_report()
+```
+
+## "A only" Regulators
+
+```{r go-aonly, fig.height=6}
+if (length(only_A) >= 5) {
+  go_aonly <- run_topgo(only_A, bg_genes)
+  go_aonly %>% kable(caption = "GO BP — 'A only' post-transcriptional regulators") %>%
+    kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE, font_size = 11)
+  go_aonly %>%
+    mutate(Fisher = as.numeric(gsub("< ", "", Fisher)), nlp = -log10(Fisher)) %>%
+    slice_max(nlp, n = 15) %>%
+    ggplot(aes(nlp, reorder(Term, nlp))) +
+    geom_col(fill = "#E64B35", alpha = 0.7, width = 0.7) +
+    labs(x = expression(-log[10](p)), y = NULL,
+         title = "GO: 'A only' Post-Transcriptional Regulators") +
+    theme_report()
+} else {
+  cat("Too few 'A only' regulators for GO.\n")
+}
+```
+
+## mTOR / ERK / 5'TOP Analysis {.tabset}
+
+> **Aim:** Test whether the identified regulators show specific relationships
+> with known mTOR and ERK pathway markers, and whether 5'TOP genes (whose
+> translation is directly controlled by mTOR via 4E-BP1/eIF4E) are
+> preferentially explained by Model A.
+>
+> **Marker definitions:**
+>
+> - **Positive markers** (mTOR/ERK): expression decreases upon pathway
+>   inhibition → they track with pathway activity.
+> - **Negative markers** (mTOR/ERK): expression increases upon pathway
+>   inhibition → they are inversely related to pathway activity.
+> - **5'TOP genes:** contain a 5' terminal oligopyrimidine tract; their
+>   translation is directly regulated by mTOR–4E-BP1–eIF4E signalling.
+### Load Gene Lists
+
+```{r load-gene-lists}
+top_genes <- trimws(readLines(top_genes_path))
+top_genes <- top_genes[nzchar(top_genes)]
+
+mtor_pos <- trimws(readLines(mtor_pos_path))
+mtor_pos <- mtor_pos[nzchar(mtor_pos)]
+
+mtor_neg <- trimws(readLines(mtor_neg_path))
+mtor_neg <- mtor_neg[nzchar(mtor_neg)]
+
+erk_pos <- trimws(readLines(erk_pos_path))
+erk_pos <- erk_pos[nzchar(erk_pos)]
+
+erk_neg <- trimws(readLines(erk_neg_path))
+erk_neg <- erk_neg[nzchar(erk_neg)]
+
+mtor_all <- union(mtor_pos, mtor_neg)
+erk_all  <- union(erk_pos, erk_neg)
+
+cat(sprintf("5'TOP genes: %d (%d in filtered data)\n",
+            length(top_genes), sum(top_genes %in% genes)))
+cat(sprintf("mTOR markers: %d pos, %d neg (%d total in filtered data)\n",
+            length(mtor_pos), length(mtor_neg), sum(mtor_all %in% genes)))
+cat(sprintf("ERK markers:  %d pos, %d neg (%d total in filtered data)\n",
+            length(erk_pos), length(erk_neg), sum(erk_all %in% genes)))
+```
+
+### 5'TOP Genes as Targets: Are They Better Predicted by Model A?
+
+> **What this answers:** If mTOR-driven translational control is a major
+> post-transcriptional mechanism, then 5'TOP genes — whose translation is
+> directly regulated by mTOR — should have higher Model A R² than non-5'TOP
+> genes. Their protein residuals should be more predictable by other proteins
+> because the translational machinery (ribosomal proteins, eIF factors) that
+> controls them will appear as LASSO regulators.
+
+```{r 5top-targets, fig.height=5}
+r2_tgt_df <- tibble(target = genes, r2_A = r2_A, r2_B = r2_B) %>%
+  filter(is.finite(r2_A)) %>%
+  mutate(is_5top = target %in% top_genes,
+         group   = if_else(is_5top, "5'TOP", "Other"))
+
+# ── Boxplot ──
+ggplot(r2_tgt_df, aes(x = group, y = r2_A, fill = group)) +
+  geom_boxplot(width = 0.5, alpha = 0.7, outlier.alpha = 0.3) +
+  geom_jitter(width = 0.15, size = 0.8, alpha = 0.2) +
+  scale_fill_manual(values = c("5'TOP" = "#E64B35", "Other" = "grey70")) +
+  labs(x = NULL, y = "R² (Model A, out-of-sample)",
+       title = "Are 5'TOP Gene Residuals Better Predicted by Proteins?",
+       subtitle = sprintf("5'TOP: n=%d, Other: n=%d",
+                          sum(r2_tgt_df$is_5top), sum(!r2_tgt_df$is_5top))) +
+  theme_report() + theme(legend.position = "none")
+
+# ── Wilcoxon test ──
+wt <- wilcox.test(r2_A ~ is_5top, data = r2_tgt_df)
+cat(sprintf("Wilcoxon p-value: %.2e\n", wt$p.value))
+cat(sprintf("Median R² — 5'TOP: %.3f, Other: %.3f\n",
+            median(r2_tgt_df$r2_A[r2_tgt_df$is_5top]),
+            median(r2_tgt_df$r2_A[!r2_tgt_df$is_5top])))
+```
+
+
+```{r 5top-a-vs-b, fig.height=5}
+# ── Same comparison for Model B — if 5'TOP are also well-predicted by mRNAs,
+#    the signal may be co-transcriptional rather than translational ──
+r2_tgt_ab <- r2_tgt_df %>% filter(is.finite(r2_B))
+
+ggplot(r2_tgt_ab %>% pivot_longer(c(r2_A, r2_B), names_to = "model", values_to = "r2") %>%
+         mutate(model = recode(model, r2_A = "Model A (proteins)", r2_B = "Model B (mRNAs)")),
+       aes(x = group, y = r2, fill = model)) +
+  geom_boxplot(width = 0.6, alpha = 0.7, position = position_dodge(0.7)) +
+  scale_fill_manual(values = c("Model A (proteins)" = "#E64B35",
+                                "Model B (mRNAs)" = "#4DBBD5")) +
+  labs(x = NULL, y = "R²", fill = NULL,
+       title = "5'TOP: Model A vs B",
+       subtitle = "If A >> B for 5'TOP → translational; if A ≈ B → co-transcriptional") +
+  theme_report()
+```
+
+### mTOR/ERK Markers Among HC Regulators
+
+> **What this answers:** Are mTOR or ERK pathway markers over-represented
+> among the HC protein regulators? If mTOR-positive markers (proteins that
+> track mTOR activity) appear as positive HC regulators, this suggests mTOR
+> signalling is a driver of the post-transcriptional signal.
+
+```{r pathway-enrichment-fisher}
+run_fisher <- function(fg_regs, pathway_genes, bg, label) {
+  a <- sum(fg_regs %in% pathway_genes)
+  b <- length(fg_regs) - a
+  c <- sum(bg %in% pathway_genes) - a
+  d <- length(bg) - a - b - c
+  ft <- fisher.test(matrix(c(a, b, c, d), nrow = 2))
+  tibble(pathway = label, in_HC = a, not_in_HC = c,
+         odds_ratio = ft$estimate, p_value = ft$p.value)
+}
+
+hc_proteins <- hc_A$protein
+
+fisher_results <- bind_rows(
+  run_fisher(hc_proteins, mtor_pos, bg_genes, "mTOR positive markers"),
+  run_fisher(hc_proteins, mtor_neg, bg_genes, "mTOR negative markers"),
+  run_fisher(hc_proteins, mtor_all, bg_genes, "mTOR all markers"),
+  run_fisher(hc_proteins, erk_pos,  bg_genes, "ERK positive markers"),
+  run_fisher(hc_proteins, erk_neg,  bg_genes, "ERK negative markers"),
+  run_fisher(hc_proteins, erk_all,  bg_genes, "ERK all markers"),
+  run_fisher(hc_proteins, top_genes, bg_genes, "5'TOP genes")
+)
+
+fisher_results %>%
+  mutate(significant = if_else(p_value < 0.05, "✓", "")) %>%
+  kable(digits = c(0, 0, 0, 2, 4, 0),
+        col.names = c("Pathway", "In HC regs", "In background only",
+                       "Odds ratio", "p (Fisher)", "Sig."),
+        caption = "Enrichment of pathway markers among HC regulators") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+
+```{r pathway-enrichment-bar, fig.height=5}
+fisher_results %>%
+  mutate(nlp = -log10(p_value),
+         pathway = factor(pathway, levels = rev(pathway))) %>%
+  ggplot(aes(x = nlp, y = pathway, fill = nlp > -log10(0.05))) +
+  geom_col(width = 0.7, alpha = 0.8) +
+  geom_vline(xintercept = -log10(0.05), linetype = "dashed", colour = "red3") +
+  scale_fill_manual(values = c("TRUE" = "steelblue", "FALSE" = "grey70"),
+                    guide = "none") +
+  labs(x = expression(-log[10](p)), y = NULL,
+       title = "Pathway Marker Enrichment Among HC Regulators",
+       subtitle = "Dashed line = p = 0.05") +
+  theme_report()
+```
+
+### Sign Concordance: Do mTOR/ERK Markers Match Expected Direction?
+
+> **What this answers:** mTOR-positive markers (expression tracks pathway
+> activity) should appear as **positive** HC regulators if they genuinely
+> drive translational upregulation. mTOR-negative markers should appear as
+> **negative** regulators. If the signs are concordant, the model is
+> capturing biologically meaningful directionality. Discordance would suggest
+> the model is picking up indirect or confounded associations.
+
+```{r sign-concordance}
+hc_with_sign <- hc_A %>% dplyr::select(protein, dom)
+
+sign_check <- function(pathway_genes, pathway_label, expected_sign) {
+  hits <- hc_with_sign %>% filter(protein %in% pathway_genes)
+  if (nrow(hits) == 0) return(tibble(pathway = pathway_label,
+                                      n_hits = 0, concordant = NA, pct = NA))
+  tibble(
+    pathway    = pathway_label,
+    n_hits     = nrow(hits),
+    concordant = sum(hits$dom == expected_sign),
+    pct        = sum(hits$dom == expected_sign) / nrow(hits) * 100
+  )
+}
+
+sign_tbl <- bind_rows(
+  sign_check(mtor_pos, "mTOR positive → expect positive HC", "positive"),
+  sign_check(mtor_neg, "mTOR negative → expect negative HC", "negative"),
+  sign_check(erk_pos,  "ERK positive → expect positive HC",  "positive"),
+  sign_check(erk_neg,  "ERK negative → expect negative HC",  "negative")
+)
+
+sign_tbl %>%
+  kable(digits = 1,
+        col.names = c("Pathway / expected sign", "N in HC", "Concordant", "% concordant"),
+        caption = "Sign concordance: do pathway markers match expected regulator direction?") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+### Leakage Check: Are mTOR/ERK Markers in "A only" or "Both A & B"?
+
+> **What this answers:** This is the mechanistic crux. If mTOR-positive markers
+> appear in "A only" (protein predicts residuals but mRNA doesn't), they are
+> acting post-transcriptionally — consistent with mTOR's translational arm
+> (4E-BP1/S6K1). If they appear in "Both A & B", the signal may be mTOR's
+> transcriptional arm (PGC-1α → mitochondrial gene expression) leaking
+> through the OLS correction. This distinction directly addresses the concern
+> about mitochondrial protein regulators.
+
+
+```{r leakage-pathway, fig.height=6}
+leakage_class <- tibble(
+  gene = c(only_A, in_both, only_B),
+  overlap_cat = c(rep("A only", length(only_A)),
+                  rep("Both A & B", length(in_both)),
+                  rep("B only", length(only_B)))
+)
+
+pathway_in_overlap <- leakage_class %>%
+  mutate(
+    is_mtor_pos = gene %in% mtor_pos,
+    is_mtor_neg = gene %in% mtor_neg,
+    is_erk_pos  = gene %in% erk_pos,
+    is_erk_neg  = gene %in% erk_neg,
+    is_5top     = gene %in% top_genes
+  )
+
+# ── Summary table ──
+leakage_summary <- pathway_in_overlap %>%
+  group_by(overlap_cat) %>%
+  summarise(
+    n_total    = n(),
+    mTOR_pos   = sum(is_mtor_pos),
+    mTOR_neg   = sum(is_mtor_neg),
+    ERK_pos    = sum(is_erk_pos),
+    ERK_neg    = sum(is_erk_neg),
+    `5TOP`     = sum(is_5top),
+    .groups    = "drop"
+  )
+
+leakage_summary %>%
+  kable(caption = "Pathway markers by overlap category (A only / Both / B only)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+# ── Visual ──
+leakage_long <- pathway_in_overlap %>%
+  pivot_longer(cols = starts_with("is_"),
+               names_to = "pathway", values_to = "member") %>%
+  filter(member) %>%
+  mutate(pathway = recode(pathway,
+                          is_mtor_pos = "mTOR+", is_mtor_neg = "mTOR−",
+                          is_erk_pos = "ERK+", is_erk_neg = "ERK−",
+                          is_5top = "5'TOP"))
+
+if (nrow(leakage_long) > 0) {
+  leakage_long %>%
+    dplyr::count(overlap_cat, pathway, name = "n") %>%
+    mutate(overlap_cat = factor(overlap_cat,
+                                levels = c("A only", "Both A & B", "B only"))) %>%
+    ggplot(aes(x = pathway, y = n, fill = overlap_cat)) +
+    geom_col(position = "dodge", width = 0.7, alpha = 0.85) +
+    scale_fill_manual(values = c("A only" = "#E64B35",
+                                  "Both A & B" = "#91D1C2",
+                                  "B only" = "#4DBBD5")) +
+    labs(x = "Pathway marker set", y = "# HC regulators", fill = "Overlap category",
+         title = "Where Do Pathway Markers Land?",
+         subtitle = "A only = post-transcriptional; Both = co-transcriptional leakage?") +
+    theme_report()
+} else {
+  cat("No pathway markers found among HC regulators.\n")
+}
+```
+
+### 5'TOP Genes as Targets of mTOR-Positive Regulators
+
+> **What this answers:** The most direct mechanistic prediction: mTOR-positive
+> HC regulators (proteins that track mTOR activity) should specifically predict
+> 5'TOP gene residuals, because mTOR drives 5'TOP translation via 4E-BP1.
+> We test whether the median LASSO coefficient of mTOR-positive regulators
+> is higher for 5'TOP targets than for non-5'TOP targets.
+
+```{r 5top-mtor-link, fig.height=5}
+# ── Get all Model A coefficients involving mTOR-positive regulators ──
+mtor_pos_in_hc <- intersect(mtor_pos, hc_A$protein)
+
+if (length(mtor_pos_in_hc) > 0) {
+  mtor_coefs <- coef_A_df %>%
+    filter(regulator %in% mtor_pos_in_hc) %>%
+    mutate(target_is_5top = target %in% top_genes,
+           target_group = if_else(target_is_5top, "5'TOP target", "Other target"))
+
+  if (nrow(mtor_coefs) > 0) {
+    # ── Boxplot of absolute beta ──
+    ggplot(mtor_coefs, aes(x = target_group, y = abs(beta), fill = target_group)) +
+      geom_boxplot(width = 0.5, alpha = 0.7, outlier.alpha = 0.3) +
+      scale_fill_manual(values = c("5'TOP target" = "#E64B35", "Other target" = "grey70")) +
+      labs(x = NULL, y = "|β| (LASSO coefficient)",
+           title = "mTOR-Positive Regulators: Effect Size on 5'TOP vs Other Targets",
+           subtitle = sprintf("Regulators tested: %s",
+                              paste(mtor_pos_in_hc, collapse = ", "))) +
+      theme_report() + theme(legend.position = "none")
+
+    wt2 <- wilcox.test(abs(beta) ~ target_is_5top, data = mtor_coefs)
+    cat(sprintf("Wilcoxon p-value (|β| for 5'TOP vs other): %.2e\n", wt2$p.value))
+    cat(sprintf("Median |β| — 5'TOP targets: %.4f, Other: %.4f\n",
+                median(abs(mtor_coefs$beta[mtor_coefs$target_is_5top])),
+                median(abs(mtor_coefs$beta[!mtor_coefs$target_is_5top]))))
+  } else {
+    cat("No coefficients found for mTOR-positive HC regulators.\n")
+  }
+} else {
+  cat("No mTOR-positive markers among HC regulators — cannot test 5'TOP link.\n")
+}
+```
+
+# Summary {.tabset}
+
+> **Aim:** Compile all key metrics into a single reference table for quick
+> consultation. This table should contain enough information to write the
+> results paragraph of a paper.
+
+## Key Metrics
+
+```{r summary-table}
+tribble(
+  ~Metric,                                     ~Value,
+  "Training dataset",                          "Satpathy 2021 LSCC tumour",
+  "Filtered genes × samples",                 sprintf("%d × %d", n_genes, n_samples),
+  "Median per-gene mRNA–protein ρ",            sprintf("%.3f", med_gene_cor),
+  "Median per-sample mRNA–protein ρ",          sprintf("%.3f", med_cor),
+  "Outlier samples flagged",                   as.character(nrow(outlier_samples)),
+  "Median OLS R² (protein ~ own mRNA)",        sprintf("%.3f", med_ols_r2),
+  "HC regulators (Model A — protein)",         as.character(nrow(hc_A)),
+  "  — positive",                              as.character(sum(hc_A$dom == "positive")),
+  "  — negative",                              as.character(sum(hc_A$dom == "negative")),
+  "  — post-transcriptional (A only)",         as.character(length(only_A)),
+  "  — co-transcriptional leakage (A∩B)",      as.character(length(in_both)),
+  "HC regulators (Model B — mRNA)",            as.character(nrow(hc_B)),
+  "Median R² — Model A (CV)",                  sprintf("%.3f", median(r2_A, na.rm = TRUE)),
+  "Median R² — Model B (CV)",                  sprintf("%.3f", median(r2_B, na.rm = TRUE)),
+  "Median R² — Model C (CV)",                  sprintf("%.3f", median(r2_C, na.rm = TRUE)),
+  "% targets A > B",                           sprintf("%.1f%%", pct_a_wins),
+  "LASSO vs Elastic Net ρ",                    sprintf("%.3f", cor_val),
+  "External datasets evaluated",               as.character(nrow(ext_qc_tbl))
+) %>%
+  kable(caption = "Key analysis metrics") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## Session Info
+
+```{r session-info}
+sessionInfo()
+```

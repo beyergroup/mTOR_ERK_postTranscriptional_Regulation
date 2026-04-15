@@ -3,6 +3,12 @@ title: "Proteomics Filtering Pipeline"
 subtitle: "Lung Tumour — Satpathy 2021"
 author: "Yashna Paul"
 date: "`r Sys.Date()`"
+knit: (function(input, ...) {
+    rmarkdown::render(
+      input,
+      output_dir = "../Output"
+    )
+  })
 output:
   html_document:
     toc: true
